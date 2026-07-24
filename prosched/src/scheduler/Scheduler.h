@@ -225,6 +225,8 @@ public:
       measure(p, false);
     for (Process *p : finished)
       measure(p, true);
+    for (Process *p : terminated)
+      measure(p, true);
 
     size_t rowLen = nameW + GAP + TIME_W + GAP + coreW + GAP + progW;
     std::string sep(rowLen, '-');
@@ -259,6 +261,13 @@ public:
       out << "(none)\n";
     else
       for (Process *p : finished)
+        printRow(p, true);
+    
+    out << "\nTerminated processes:\n";
+    if (terminated.empty())
+      out << "(none)\n";
+    else 
+      for (Process *p : terminated)
         printRow(p, true);
 
     out << sep << "\n" << std::endl;
