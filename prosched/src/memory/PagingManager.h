@@ -64,7 +64,14 @@ public:
    */
   PagingManager(int memPerFrame, int maxOverallMem)
       : memPerFrame(memPerFrame), maxOverallMem(maxOverallMem),
-        totalFrames(maxOverallMem / memPerFrame) {
+        totalFrames(0) {
+    
+    if (memPerFrame <= 0) {
+      std::exit(0);
+      return;
+    }
+
+    totalFrames = std::max(1, maxOverallMem/memPerFrame);
     frames.resize(totalFrames);
     for (int i = 0; i < totalFrames; ++i) {
       frames[i].frameNumber = i;
