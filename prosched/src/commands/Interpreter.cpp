@@ -734,7 +734,16 @@ std::optional<std::pair<uint32_t, uint16_t>> Interpreter::ExecuteWrite(
     return std::nullopt;
   }
 
-  const uint16_t value = ResolveOperand(stmt.args[1]);
+  uint16_t value;
+  const std::string trimmed = Trim(stmt.args[1]);
+
+  if (!trimmed.empty() && std::isdigit(static_cast<unsigned char>(trimmed[0]))) {
+    const long raw = std::stol(trimmed);
+    value = static_cast<uint16_t>(std::clamp(raw, 0L, static_cast<long>(UINT16_MAX)));
+  } else {
+    value = ResolveOperand(stmt.args[1]);
+  }
+
   address_space_[address] = value;
   return std::make_pair(address, value);
 }
