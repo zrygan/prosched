@@ -95,18 +95,11 @@ public:
   /**
    * @brief sets the memory bounds for the interpreter
    */
-  bool SetMemoryBounds(size_t start, size_t end) {
+  void SetMemoryBounds(size_t start, size_t end) {
     memStart = start;
     memEnd = end;
-
-    if (memStart > memEnd){
-      currentState = TERMINATED;
-      return false;
-    }
-
     interpreter.SetMemoryBounds(static_cast<uint32_t>(start),
                                 static_cast<uint32_t>(end));
-    return true;
   }
 
   /**

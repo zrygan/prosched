@@ -54,7 +54,7 @@ std::string FormatAddress(int page_index) {
 
 }  // namespace
 
-Statement GetRandomStatement(const std::string& process_name, int max_depth) {
+Statement GetRandomStatement(const std::string& process_name, int max_depth, int memStart, int memEnd) {
   std::mt19937& gen = Rng();
 
   std::vector<Keyword> available(kGeneratableKeywords.begin(),
@@ -108,21 +108,36 @@ Statement GetRandomStatement(const std::string& process_name, int max_depth) {
 
       stmt.args = {"", std::to_string(repeats)};
       for (int i = 0; i < body_size; ++i) {
-        stmt.nested.push_back(GetRandomStatement(process_name, max_depth + 1));
+        stmt.nested.push_back(GetRandomStatement(process_name, max_depth + 1, memStart, memEnd));
       }
       break;
     }
 
     case Keyword::kRead: {
-      std::uniform_int_distribution<int> page_dist(0, 255);
-      stmt.args = {random_variable_name(), FormatAddress(page_dist(gen))};
+      std::ostringstream addr; 
+      if (memEnd > memStart) {
+        std::uniform_int_distribution<uint32_t> addrDist(memStart, memEnd - 2);
+        uint32_t rawAddr = addrDist(gen);
+        rawAddr = (rawAddr / 2) * 2;
+        addr << "0x" << std::hex << rawAddr;
+      } else {
+          addr << "0x0";
+      }
+      stmt.args = { random_variable_name(), addr.str() };
       break;
     }
 
     case Keyword::kWrite: {
-      std::uniform_int_distribution<int> page_dist(0, 255);
-      stmt.args = {FormatAddress(page_dist(gen)),
-                   std::to_string(uint16_dist(gen))};
+      std::ostringstream addr; 
+      if (memEnd > memStart) {
+        std::uniform_int_distribution<uint32_t> addrDist(memStart, memEnd - 2);
+        uint32_t rawAddr = addrDist(gen);
+        rawAddr = (rawAddr / 2) * 2;
+        addr << "0x" << std::hex << rawAddr;
+      } else {
+          addr << "0x0";
+      }
+      stmt.args = { addr.str(), std::to_string(uint16_dist(gen)) };
       break;
     }
 

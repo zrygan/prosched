@@ -51,7 +51,8 @@ struct Statement {
     @return A randomly generated Statement, never UNKNOWN or DBG
 */
 Statement GetRandomStatement(const std::string& process_name,
-                             int max_depth = 0);
+                             int max_depth = 0, int memStart = 0, 
+                             int memEnd = 0);
 
 }  // namespace prosched
 

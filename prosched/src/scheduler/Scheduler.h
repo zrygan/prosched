@@ -198,9 +198,9 @@ public:
     for (Process *p : processes) {
       if (p == nullptr)
         continue;
-      if (p->IsTerminated())
+      if (p->GetState() == TERMINATED)
         terminated.push_back(p);
-      else if (p->IsFinished())
+      else if (p->GetState() == FINISHED)
         finished.push_back(p);
       else
         running.push_back(p);
@@ -331,7 +331,7 @@ public:
         this->ctx.min_ins + rand() % (ctx->max_ins - ctx->min_ins + 1);
 
     for (int i = 0; i < commandAmount; i++) {
-      instruction = prosched::GetRandomStatement(name, 3);
+      instruction = prosched::GetRandomStatement(name, 3, 0, static_cast<uint32_t>(rolledSize));
       p->AddInstruction(instruction);
       // std::cout << p->GetName() << " added an instruction\n";
     }
@@ -400,7 +400,7 @@ public:
     int commandAmount = this->ctx.min_ins +
                         rand() % (this->ctx.max_ins - this->ctx.min_ins + 1);
     for (int i = 0; i < commandAmount; i++) {
-      Statement instruction = prosched::GetRandomStatement(name, 3);
+      Statement instruction = prosched::GetRandomStatement(name, 3, 0, static_cast<size_t>(memoryBytes));
       p->AddInstruction(instruction);
     }
     return p;
