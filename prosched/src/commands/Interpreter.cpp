@@ -492,7 +492,14 @@ uint16_t Interpreter::ResolveOperand(const std::string& op) {
     return 0;
   }
   if (std::isdigit(static_cast<unsigned char>(t[0]))) {
-    return static_cast<uint16_t>(std::stoul(t));
+    try {
+      const unsigned long raw = std::stoul(t);
+      return static_cast<uint16_t>(std::min(raw, static_cast<unsigned long>(UINT16_MAX)));
+    } catch (const std::out_of_range&) {
+      return UINT16_MAX;
+    } catch (const std::invalid_argument&) {
+      return 0;
+    }
   }
 
   const auto it = memory_.find(t);
@@ -733,26 +740,8 @@ std::optional<std::pair<uint32_t, uint16_t>> Interpreter::ExecuteWrite(
     last_instruction_page_fault_ = true;
     return std::nullopt;
   }
-
-  uint16_t value;
-  const std::string trimmed = Trim(stmt.args[1]);
-
-  if (!trimmed.empty() && std::isdigit(static_cast<unsigned char>(trimmed[0]))) {
-    uint16_t clamped = UINT16_MAX;
-
-    try {
-      const long raw = std::stol(trimmed);
-      clamped = static_cast<uint16_t>(std::clamp(raw, 0L, static_cast<long>(UINT16_MAX)));
-    } catch (const std::out_of_range&) {
-      clamped = UINT16_MAX;
-    } catch (const std::invalid_argument&){
-      clamped = 0;
-    }
-    
-  } else {
-    value = ResolveOperand(stmt.args[1]);
-  }
-
+  
+  const uint16_t value = ResolveOperand(stmt.args[1]);
   address_space_[address] = value;
   return std::make_pair(address, value);
 }
