@@ -67,7 +67,8 @@ public:
         totalFrames(0) {
     
     if (memPerFrame <= 0) {
-      std::exit(0);
+      std::cerr << "mem-per-frame must be > 0, got " << memPerFrame << "\n";
+      std::exit(1);
       return;
     }
 
