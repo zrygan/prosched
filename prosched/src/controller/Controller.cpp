@@ -40,6 +40,11 @@ AlgoContext Controller::initialize() {
     std::exit(1);
   }
 
+  if(this->ctx.min_mem_per_proc > this->ctx.max_mem_per_proc) {
+    std::cerr << "Invalid config: min-mem-per-proc must be lesser than max-mem-per-proc\n";
+    std::exit(1);
+  }
+
   if(this->ctx.mem_per_frame <= 0) {
     std::cerr << "Invalid config: mem-per-frame must be > 0, got " << this->ctx.mem_per_frame << "\n";
     std::exit(1);

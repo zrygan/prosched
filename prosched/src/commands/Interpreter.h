@@ -412,6 +412,15 @@ class Interpreter {
   */
   AccessStatus CheckAccess(uint32_t address);
 
+  /** @brief
+   * 
+   * Checks if the symbol table occupies the first 64 bytes of the 
+   * process address space
+   * 
+   * @return boolean value if spavce is allocated or not
+   */
+  bool Interpreter::CheckSymbolTableAccess();
+
   /** @brief Execute a single AST node.
 
       Dispatches to the appropriate execution handler based on the statement's

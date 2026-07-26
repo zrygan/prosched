@@ -34,6 +34,10 @@ constexpr std::size_t kForBodyScanStart = 4;
 /** @brief One SLEEP tick, in milliseconds. */
 constexpr int kTickMs = 10;
 
+/** @brief the amount of memory held by the symbol table */
+constexpr uint32_t symbol_table_start = 0;
+constexpr uint32_t symbol_table_end = 64;
+
 /** @brief Number of arguments each keyword requires.
 
     A user-supplied instruction that does not carry exactly this many
@@ -511,6 +515,10 @@ uint16_t Interpreter::ResolveOperand(const std::string& op) {
 }
 
 bool Interpreter::SetVariable(const std::string& name, uint16_t value) {
+  if (!CheckSymbolTableAccess()) {
+    return false;
+  }
+  
   const auto it = memory_.find(name);
   if (it != memory_.end()) {
     it->second = value;
@@ -559,6 +567,19 @@ Interpreter::AccessStatus Interpreter::CheckAccess(uint32_t address) {
     return AccessStatus::kFault;
   }
   return AccessStatus::kOk;
+}
+
+bool Interpreter::CheckSymbolTableAccess() {
+  if (page_fault_handler_ == nullptr || page_size_bytes_ == 0) {
+    return true;
+  }
+
+  const int pageNumber = static_cast<int>(symbol_table_start/page_size_bytes_);
+  if (page_fault_handler_(pageNumber)) {
+      last_instruction_page_fault_ = true;
+      return false;
+  }
+  return true;
 }
 
 void Interpreter::ExecuteStatement(const Statement& stmt) {
