@@ -552,8 +552,7 @@ TEST(InterpreterReadWriteHappyPath, WriteReadPrintMatchesSpecExample) {
 }
 
 // MO2: "uint16 variables are clamped between (0, max(uint16))." DECLARE clamps an
-// out-of-range value to 65535; WRITE should store the same clamped value. It
-// currently WRAPS instead (ResolveOperand static_casts: 70000 -> 4464).
+// out-of-range value to 65535; WRITE now clamps the same way (70000 -> 65535).
 TEST(InterpreterReadWriteHappyPath, WriteClampsUint16OverflowLikeDeclare) {
   prosched::Interpreter interp;
   interp.SetMemoryBounds(0, 0x100);
@@ -562,6 +561,20 @@ TEST(InterpreterReadWriteHappyPath, WriteClampsUint16OverflowLikeDeclare) {
       interp.ExecuteRead(makeStmt(prosched::Keyword::kRead, {"v", "0x10"}));
   ASSERT_TRUE(read_result.has_value());
   EXPECT_EQ(read_result->second, 65535);
+}
+
+// MO2 clamp must hold for ANY out-of-range value, but the clamp path uses an
+// unguarded std::stol — a value larger than LONG_MAX throws std::out_of_range
+// instead of clamping to 65535. (Same unguarded stol exists in ExecuteDeclare.)
+TEST(InterpreterReadWriteHappyPath, WriteClampsValueExceedingLongDoesNotThrow) {
+  prosched::Interpreter interp;
+  interp.SetMemoryBounds(0, 0x100);
+  std::optional<std::pair<uint32_t, uint16_t>> result;
+  EXPECT_NO_THROW(result = interp.ExecuteWrite(makeStmt(
+                      prosched::Keyword::kWrite,
+                      {"0x10", "99999999999999999999999"})));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->second, 65535);
 }
 
 } // namespace InterpreterReadWriteHappyPath
