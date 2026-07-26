@@ -42,9 +42,12 @@ static AlgoContext makeSmallCtx(const std::string &algo, int num_cpu = 1,
 namespace SchedulerAddProcess {
 
 // AddProcess returns the same pointer that was passed in
+// NOTE: Process objects are declared BEFORE the Scheduler so the Scheduler
+// (destroyed first, in reverse order) doesn't read freed process pointers in
+// ~Scheduler -> IsOwnedByScheduler(). (ASan: heap-use-after-free otherwise.)
 TEST(SchedulerAddProcess, ReturnsSameProcess) {
-  prosched::Scheduler scheduler(makeTestCtx());
   prosched::Process p("test_process", 1, 0);
+  prosched::Scheduler scheduler(makeTestCtx());
 
   prosched::Process *result = scheduler.AddProcess(&p);
 
@@ -55,9 +58,9 @@ TEST(SchedulerAddProcess, ReturnsSameProcess) {
 
 // Adding multiple processes should each return their own identity
 TEST(SchedulerAddProcess, MultipleProcessesReturnCorrectly) {
-  prosched::Scheduler scheduler(makeTestCtx());
   prosched::Process p1("proc_alpha", 1, 0);
   prosched::Process p2("proc_beta", 2, 1);
+  prosched::Scheduler scheduler(makeTestCtx());
 
   prosched::Process *r1 = scheduler.AddProcess(&p1);
   prosched::Process *r2 = scheduler.AddProcess(&p2);
@@ -72,8 +75,8 @@ TEST(SchedulerAddProcess, MultipleProcessesReturnCorrectly) {
 
 // Empty process name is still accepted
 TEST(SchedulerAddProcess, EmptyProcessName) {
-  prosched::Scheduler scheduler(makeTestCtx());
   prosched::Process p("", 1, 0);
+  prosched::Scheduler scheduler(makeTestCtx());
 
   prosched::Process *result = scheduler.AddProcess(&p);
 
@@ -83,8 +86,8 @@ TEST(SchedulerAddProcess, EmptyProcessName) {
 
 // PID 0 is a valid boundary value
 TEST(SchedulerAddProcess, PIDZero) {
-  prosched::Scheduler scheduler(makeTestCtx());
   prosched::Process p("pid_zero", 0, 0);
+  prosched::Scheduler scheduler(makeTestCtx());
 
   prosched::Process *result = scheduler.AddProcess(&p);
 
@@ -94,8 +97,8 @@ TEST(SchedulerAddProcess, PIDZero) {
 
 // Same pointer added twice — scheduler must not crash or corrupt
 TEST(SchedulerAddProcess, DuplicatePID) {
-  prosched::Scheduler scheduler(makeTestCtx());
   prosched::Process p("dup", 5, 0);
+  prosched::Scheduler scheduler(makeTestCtx());
 
   prosched::Process *r1 = scheduler.AddProcess(&p);
   prosched::Process *r2 = scheduler.AddProcess(&p);
@@ -108,8 +111,8 @@ TEST(SchedulerAddProcess, DuplicatePID) {
 
 // INT_MAX arrival tick must not overflow or crash
 TEST(SchedulerAddProcess, LargeArrivalTick) {
-  prosched::Scheduler scheduler(makeTestCtx());
   prosched::Process p("late_proc", 1, INT_MAX);
+  prosched::Scheduler scheduler(makeTestCtx());
 
   prosched::Process *result = scheduler.AddProcess(&p);
 
@@ -120,12 +123,12 @@ TEST(SchedulerAddProcess, LargeArrivalTick) {
 
 // Adding more processes than num_cpu must not drop any
 TEST(SchedulerAddProcess, MoreProcessesThanCores) {
-  prosched::Scheduler scheduler(makeTestCtx());
   const int count = 10;
   std::vector<prosched::Process> procs;
   procs.reserve(count);
   for (int i = 0; i < count; i++)
     procs.emplace_back("p" + std::to_string(i), i, i);
+  prosched::Scheduler scheduler(makeTestCtx());
 
   for (int i = 0; i < count; i++) {
     prosched::Process *result = scheduler.AddProcess(&procs[i]);
@@ -137,9 +140,9 @@ TEST(SchedulerAddProcess, MoreProcessesThanCores) {
 
 // Out-of-chronological-order arrival ticks must both be accepted
 TEST(SchedulerAddProcess, OutOfOrderArrivalTick) {
-  prosched::Scheduler scheduler(makeTestCtx());
   prosched::Process late("late_proc", 1, 100);
   prosched::Process early("early_proc", 2, 0);
+  prosched::Scheduler scheduler(makeTestCtx());
 
   prosched::Process *r_late = scheduler.AddProcess(&late);
   prosched::Process *r_early = scheduler.AddProcess(&early);
@@ -163,11 +166,11 @@ TEST(SchedulerAddProcess, NullProcessReturnsNull) {
 // process generation and FCFS — must return the same pointer even under
 // contention
 TEST(SchedulerAddProcess, AddWhileRunningReturnsSamePointer) {
-  prosched::Scheduler scheduler(makeTestCtx());
-  scheduler.Start();
-
   prosched::Process p("live_add", 1, 0);
   AddRaw(p, "PRINT(\"hi\")");
+
+  prosched::Scheduler scheduler(makeTestCtx());
+  scheduler.Start();
 
   prosched::Process *result = scheduler.AddProcess(&p);
   EXPECT_EQ(result, &p);
@@ -1464,3 +1467,29 @@ TEST(SchedulerFindTerminatedProcess, ReturnsNullForUnknownName) {
 }
 
 } // namespace SchedulerFindTerminatedProcess
+
+// ─── SchedulerConfigValidation ─────────────────────────────────────────────
+// MO2: config values must be validated. There is no production validation, so
+// bad ranges flow into rand() % (max - min + 1). With max-ins = min-ins - 1 the
+// divisor is 0 -> rand() % 0 -> SIGFPE (Scheduler.h ~401, also generateProcess).
+namespace SchedulerConfigValidation {
+
+// CreateNamedProcess must not crash when max-ins < min-ins; the child should
+// exit cleanly, not die by SIGFPE.
+TEST(SchedulerConfigValidation, MaxInsBelowMinInsDoesNotCrash) {
+  EXPECT_EXIT(
+      {
+        ConfigStruct *cs = makeDefault();
+        cs->min_ins = 100;
+        cs->max_ins = 99; // divisor (max - min + 1) == 0
+        AlgoContext ctx = AlgoContext::buildConfig(cs);
+        delete cs;
+        prosched::Scheduler scheduler(ctx);
+        prosched::Process *p = scheduler.CreateNamedProcess("x", 256);
+        (void)p;
+        std::exit(0);
+      },
+      ::testing::ExitedWithCode(0), ".*");
+}
+
+} // namespace SchedulerConfigValidation
