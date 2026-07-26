@@ -35,6 +35,11 @@ AlgoContext Controller::initialize() {
 
   this->ctx = AlgoContext::buildConfig(cs);
 
+  if (this->ctx.min_ins > this->ctx.max_ins) {
+    std::cerr << "min-ins must be lesser than max-ins\n";
+    std::exit(0);
+  }
+
   if(this->ctx.mem_per_frame <= 0) {
     std::cerr << "mem-per-frame must be > 0, got " << this->ctx.mem_per_frame << "\n";
     std::exit(1);
