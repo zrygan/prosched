@@ -738,8 +738,17 @@ std::optional<std::pair<uint32_t, uint16_t>> Interpreter::ExecuteWrite(
   const std::string trimmed = Trim(stmt.args[1]);
 
   if (!trimmed.empty() && std::isdigit(static_cast<unsigned char>(trimmed[0]))) {
-    const long raw = std::stol(trimmed);
-    value = static_cast<uint16_t>(std::clamp(raw, 0L, static_cast<long>(UINT16_MAX)));
+    uint16_t clamped = UINT16_MAX;
+
+    try {
+      const long raw = std::stol(trimmed);
+      clamped = static_cast<uint16_t>(std::clamp(raw, 0L, static_cast<long>(UINT16_MAX)));
+    } catch (const std::out_of_range&) {
+      clamped = UINT16_MAX;
+    } catch (const std::invalid_argument&){
+      clamped = 0;
+    }
+    
   } else {
     value = ResolveOperand(stmt.args[1]);
   }
