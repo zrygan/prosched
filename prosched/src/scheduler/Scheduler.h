@@ -42,7 +42,13 @@ public:
    * @param ctx Scheduling configuration and algorithm settings
    */
   Scheduler(AlgoContext ctx, PagingManager *pagingManager = nullptr)
-      : ctx(ctx), pagingManager(pagingManager) {}
+      : ctx(ctx), pagingManager(pagingManager) {
+
+        if (ctx.min_ins > ctx.max_ins) {
+          std::cerr << "Invalid config: min-ins must be lesser than max-ins\n";
+          std::exit(1);
+        }
+      }
 
   /**
    * @brief Destroys the scheduler instance
@@ -247,6 +253,16 @@ public:
       out << padR(p->GetName(), nameW + GAP) << padR(ts, TIME_W + GAP)
           << padR(coreStr, coreW + GAP) << prog << "\n";
     };
+
+    // i added this here for testing, it caps the number of processes shown per array
+    auto lastN = [](const std::vector<Process*>& v, int n) {
+      int start = std::max(0, (int)v.size() - n);
+      return std::vector<Process*>(v.begin() + start, v.end());
+    };
+
+    auto recentRunning = lastN(running, 20);
+    auto recentFinished = lastN(finished, 10);
+    auto recentTerminated = lastN(terminated, 10);
 
     out << "\n" << sep << "\n";
     out << "Running processes:\n";
