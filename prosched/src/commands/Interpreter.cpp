@@ -670,7 +670,18 @@ void Interpreter::ExecuteSleep(const Statement& stmt) {
   if (stmt.args.empty()) {
     return;
   }
-  const uint8_t ticks = static_cast<uint8_t>(std::stoul(stmt.args[0]));
+  
+  uint8_t ticks = 0;
+
+  try {
+    const unsigned long raw = std::stoul(stmt.args[0]);
+    ticks = static_cast<uint8_t>(std::min(raw, static_cast<unsigned long>(UINT8_MAX)));
+  } catch (const std::out_of_range&) {
+      ticks = UINT8_MAX;
+  } catch (const std::invalid_argument&) {
+      ticks = 0;
+  }
+
   std::this_thread::sleep_for(std::chrono::milliseconds(ticks * kTickMs));
 }
 
@@ -740,7 +751,7 @@ std::optional<std::pair<uint32_t, uint16_t>> Interpreter::ExecuteWrite(
     last_instruction_page_fault_ = true;
     return std::nullopt;
   }
-  
+
   const uint16_t value = ResolveOperand(stmt.args[1]);
   address_space_[address] = value;
   return std::make_pair(address, value);
