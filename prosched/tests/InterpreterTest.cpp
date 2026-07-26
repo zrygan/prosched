@@ -678,6 +678,115 @@ TEST(InterpreterReadWritePageFault, ReadFaultRetriesInsteadOfViolating) {
 
 } // namespace InterpreterReadWritePageFault
 
+// ─── Symbol-table segment paging (MO2) ──────────────────────────────────────
+// MO2: "Symbol table segment: fixed 64 bytes, MAX 32 variables" (2 bytes/var ×
+// 32 = 64). The symbol table is a region of the process's own memory, not a
+// side table living outside it, and the spec states the consequence directly:
+// "Even variable DECLAREs fault if the symbol-table segment isn't resident."
+//
+// So any instruction that stores a variable is a memory access and must consult
+// the pager, exactly as READ/WRITE do. These tests deliberately do NOT assert
+// which page the segment occupies — the spec fixes its size (64 bytes) but not
+// its address — only that the access is routed through the pager at all.
+//
+// FAILING: ExecuteDeclare/ExecuteAdd/ExecuteSubtract call SetVariable directly
+// and never reach CheckAccess, so the symbol table can never page-fault; only
+// READ/WRITE touch the paged address space. Practical effect on the MO2 demo
+// configs: 2 of the 8 generated keywords can fault, so paging traffic lands at
+// roughly a quarter of what "for every instruction executed, the memory manager
+// will attempt to page in/page out" implies.
+
+namespace InterpreterSymbolSegmentPaging {
+
+// Stands in for a pager with nothing resident: every page consulted is reported
+// as a fault. Records the pages it was asked about, so a test can tell "the
+// pager said resident" apart from "the pager was never consulted at all".
+static std::function<bool(int)>
+recordingAlwaysFaultHandler(std::vector<int> *consulted) {
+  return [consulted](int pageNum) {
+    consulted->push_back(pageNum);
+    return true; // not resident -> page fault
+  };
+}
+
+// Paging switched on, sized like the MO2 demo config: a 1024-byte process over
+// 256-byte frames, so 4 pages.
+static void enablePaging(prosched::Interpreter &interp,
+                         std::vector<int> *consulted) {
+  interp.SetMemoryBounds(0, 1024);
+  interp.SetPageSize(256);
+  interp.SetPageFaultHandler(recordingAlwaysFaultHandler(consulted));
+  interp.ResetLastInstructionPageFault();
+  interp.ResetLastInstructionAccessViolation();
+}
+
+// MO2, verbatim: "Even variable DECLAREs fault if the symbol-table segment
+// isn't resident."
+TEST(InterpreterSymbolSegmentPaging,
+     DeclareFaultsWhenSymbolSegmentNotResident) {
+  prosched::Interpreter interp;
+  std::vector<int> consulted;
+  enablePaging(interp, &consulted);
+
+  interp.ExecuteDeclare(makeStmt(prosched::Keyword::kDeclare, {"varA", "10"}));
+
+  EXPECT_FALSE(consulted.empty())
+      << "DECLARE never consulted the pager: the symbol table lives outside "
+         "the paged address space";
+  EXPECT_TRUE(interp.GetLastInstructionPageFault())
+      << "storing a variable writes the symbol-table segment, so it must fault "
+         "while that segment is non-resident";
+}
+
+// ADD stores its result into a variable, i.e. into the symbol-table segment.
+// The spec's "even ... DECLAREs" phrasing marks DECLARE as the least obvious
+// case, so the ordinary variable writes must fault too.
+TEST(InterpreterSymbolSegmentPaging, AddFaultsWhenSymbolSegmentNotResident) {
+  prosched::Interpreter interp;
+  std::vector<int> consulted;
+  enablePaging(interp, &consulted);
+
+  interp.ExecuteAdd(makeStmt(prosched::Keyword::kAdd, {"varA", "varB", "5"}));
+
+  EXPECT_FALSE(consulted.empty())
+      << "ADD never consulted the pager while writing a variable";
+  EXPECT_TRUE(interp.GetLastInstructionPageFault())
+      << "ADD writes the symbol-table segment, so it must fault while that "
+         "segment is non-resident";
+}
+
+// Same requirement for SUBTRACT.
+TEST(InterpreterSymbolSegmentPaging,
+     SubtractFaultsWhenSymbolSegmentNotResident) {
+  prosched::Interpreter interp;
+  std::vector<int> consulted;
+  enablePaging(interp, &consulted);
+
+  interp.ExecuteSubtract(
+      makeStmt(prosched::Keyword::kSubtract, {"varA", "varB", "5"}));
+
+  EXPECT_FALSE(consulted.empty())
+      << "SUBTRACT never consulted the pager while writing a variable";
+  EXPECT_TRUE(interp.GetLastInstructionPageFault())
+      << "SUBTRACT writes the symbol-table segment, so it must fault while "
+         "that segment is non-resident";
+}
+
+// A faulting DECLARE must be retryable, not a shutdown: the symbol segment is
+// inside the process's own space, so it can never be an access violation.
+TEST(InterpreterSymbolSegmentPaging, DeclareFaultIsNotAnAccessViolation) {
+  prosched::Interpreter interp;
+  std::vector<int> consulted;
+  enablePaging(interp, &consulted);
+
+  interp.ExecuteDeclare(makeStmt(prosched::Keyword::kDeclare, {"varA", "10"}));
+
+  EXPECT_FALSE(interp.GetLastInstructionAccessViolation())
+      << "a symbol-segment page fault must not shut the process down";
+}
+
+} // namespace InterpreterSymbolSegmentPaging
+
 // ─── ParseUserProgram (screen -c, MO2) ──────────────────────────────────────
 // MO2: screen -c instructions are semicolon-separated with space-separated args
 // (e.g. "DECLARE varA 10; ADD varA varA varB").

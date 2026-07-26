@@ -664,3 +664,118 @@ TEST(WorkerRunCycle, RunningProcessInvokesTickExecution) {
 }
 
 } // namespace WorkerRunCycle
+
+// ─── Page faults vs. the round-robin quantum (MO2) ──────────────────────────
+// MO2: "an instruction executes only once its page is valid; page-fault
+// handling repeats until a valid frame is found, THEN the instruction runs."
+//
+// A page fault correctly does not advance the instruction index — the
+// instruction is retried. But the faulting tick still counts against the RR
+// quantum, so when quantum-cycles is 1 the process is preempted immediately
+// after servicing the fault and the retry never happens. Its page is evicted
+// while it waits for its next turn, so the next dispatch faults on the same
+// instruction, and so on without end.
+//
+// This is not hypothetical: the MO2 demo config is num-cpu 8 / quantum-cycles 1
+// / max-overall-mem 1024 / mem-per-frame 256 — 4 frames shared by 8 cores, so a
+// page is always gone before its owner runs again.
+
+namespace WorkerPageFaultQuantum {
+
+static void AddWrite(prosched::Process &p, const std::string &addr,
+                     const std::string &value) {
+  prosched::Statement s;
+  s.keyword = prosched::Keyword::kWrite;
+  s.args = {addr, value};
+  p.AddInstruction(s);
+}
+
+static AlgoContext makeRrCtx(int quantum) {
+  AlgoContext ctx = makeTestCtx();
+  ctx.schedulerType = SchedulerType::RR;
+  ctx.rr_quantum_cycles = quantum;
+  ctx.delay_per_execution = 0;
+  return ctx;
+}
+
+// A single-frame pager: servicing a fault makes that page resident, and any
+// later page evicts it. `residentPage` is reset to -1 between turns by the
+// caller, modelling the other seven cores taking every frame while this process
+// sits in the ready queue.
+static void attachSingleFramePager(prosched::Process &p, int *residentPage,
+                                   int *pageIns) {
+  p.SetMemoryBounds(0, 1024);
+  p.GetInterpreter().SetPageSize(256);
+  p.GetInterpreter().SetPageFaultHandler([residentPage, pageIns](int pageNum) {
+    if (*residentPage == pageNum) {
+      return false; // resident -> no fault, instruction proceeds
+    }
+    *residentPage = pageNum; // pager brings it in
+    ++*pageIns;
+    return true; // faulted this tick; instruction is retried
+  });
+}
+
+// Drives the scheduler's per-tick sequence (SchedulerLoop runs
+// TriggerWorkersTick, then RoundRobin's quantum check) for one process on one
+// core, for at most `turns` dispatches. Stops early once the process makes
+// forward progress.
+static void RunDispatchTurns(prosched::Worker &w, prosched::Process &p,
+                             int quantum, int *residentPage, int turns) {
+  for (int turn = 0; turn < turns; ++turn) {
+    *residentPage = -1;  // evicted while the process waited for this turn
+    w.AssignProcess(&p); // dispatch; RR resets the quantum here
+    while (w.IsBusy()) {
+      w.RunCycle();
+      if (w.CheckAndIncrementQuantum(quantum)) {
+        w.PreemptProcess();
+        w.GetAndClearPreemptedProcess(); // scheduler re-queues it
+        break;
+      }
+    }
+    if (p.GetCurrentInstructionIndex() > 0) {
+      break;
+    }
+  }
+}
+
+// FAILING: with quantum-cycles 1 the fault consumes the entire quantum, so the
+// retry never runs and the process is frozen on its first memory instruction.
+TEST(WorkerPageFaultQuantum, FaultingInstructionRetiresWithQuantumOne) {
+  AlgoContext ctx = makeRrCtx(1);
+  int residentPage = -1;
+  int pageIns = 0;
+
+  prosched::Worker w(0, ctx);
+  prosched::Process p("quantum_fault_1", 1, 0);
+  AddWrite(p, "0x100", "42");
+  attachSingleFramePager(p, &residentPage, &pageIns);
+
+  RunDispatchTurns(w, p, ctx.rr_quantum_cycles, &residentPage, 50);
+
+  EXPECT_GT(p.GetCurrentInstructionIndex(), 0)
+      << "instruction never retired across 50 dispatches (" << pageIns
+      << " page-ins): the page-fault tick burns the whole quantum, so the "
+         "retry the spec requires never gets to run";
+}
+
+// Control: the same process and the same pager, with room for one tick after
+// the fault. This is the behaviour the test above should have, and it isolates
+// the quantum — not the retry model — as the cause.
+TEST(WorkerPageFaultQuantum, FaultingInstructionRetiresWhenQuantumAllowsRetry) {
+  AlgoContext ctx = makeRrCtx(2);
+  int residentPage = -1;
+  int pageIns = 0;
+
+  prosched::Worker w(0, ctx);
+  prosched::Process p("quantum_fault_2", 2, 0);
+  AddWrite(p, "0x100", "42");
+  attachSingleFramePager(p, &residentPage, &pageIns);
+
+  RunDispatchTurns(w, p, ctx.rr_quantum_cycles, &residentPage, 50);
+
+  EXPECT_GT(p.GetCurrentInstructionIndex(), 0)
+      << "with a spare tick after the fault the retry should have executed";
+}
+
+} // namespace WorkerPageFaultQuantum
