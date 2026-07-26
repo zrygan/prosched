@@ -154,6 +154,21 @@ TEST(InterpreterExecutePrint, ConcatStringAndVariable) {
   EXPECT_EQ(interp.ExecutePrint(stmt), "val=5");
 }
 
+// A PRINT whose concat left-part is empty ("+x") makes ExecutePrint call
+// str_part.front() on an empty string — UB, which aborts under
+// -D_GLIBCXX_ASSERTIONS (the flag the real exe builds with). Reachable via
+// screen -c "PRINT(+x)". Run as a death test: the child must exit cleanly, not
+// abort. (Fix: guard the .front()/.back() calls with !empty().)
+TEST(InterpreterExecutePrint, EmptyConcatLeftPartDoesNotCrash) {
+  EXPECT_EXIT(
+      {
+        prosched::Interpreter interp;
+        interp.ExecuteString("PRINT(+x)");
+        std::exit(0);
+      },
+      ::testing::ExitedWithCode(0), ".*");
+}
+
 } // namespace InterpreterExecutePrint
 
 // ─── ExecuteDeclare
@@ -249,6 +264,17 @@ TEST(InterpreterExecuteAdd, MissingArgsReturnsNullopt) {
   EXPECT_FALSE(result.has_value());
 }
 
+// MO2: operands are uint16 (clamped). ResolveOperand uses an unguarded
+// std::stoul, so an operand larger than ULONG_MAX throws instead of clamping.
+// (ADD, SUBTRACT, and WRITE's value all resolve operands this way.)
+TEST(InterpreterExecuteAdd, OverflowOperandDoesNotThrow) {
+  prosched::Interpreter interp;
+  std::optional<uint16_t> result;
+  EXPECT_NO_THROW(result = interp.ExecuteAdd(makeStmt(
+      prosched::Keyword::kAdd, {"z", "99999999999999999999999", "0"})));
+  EXPECT_TRUE(result.has_value());
+}
+
 } // namespace InterpreterExecuteAdd
 
 // ─── ExecuteSubtract
@@ -305,6 +331,14 @@ TEST(InterpreterExecuteSleep, OneTickCompletes) {
   prosched::Interpreter interp;
   EXPECT_NO_THROW(
       interp.ExecuteSleep(makeStmt(prosched::Keyword::kSleep, {"1"})));
+}
+
+// ExecuteSleep uses an unguarded std::stoul on the tick count — a value larger
+// than ULONG_MAX throws instead of being handled gracefully.
+TEST(InterpreterExecuteSleep, OverflowArgDoesNotThrow) {
+  prosched::Interpreter interp;
+  EXPECT_NO_THROW(interp.ExecuteSleep(
+      makeStmt(prosched::Keyword::kSleep, {"99999999999999999999999"})));
 }
 
 } // namespace InterpreterExecuteSleep
