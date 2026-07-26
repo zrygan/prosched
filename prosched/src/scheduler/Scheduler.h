@@ -347,7 +347,7 @@ public:
         this->ctx.min_ins + rand() % (ctx->max_ins - ctx->min_ins + 1);
 
     for (int i = 0; i < commandAmount; i++) {
-      instruction = prosched::GetRandomStatement(name, 3, 0, static_cast<uint32_t>(rolledSize));
+      instruction = prosched::GetRandomStatement(name, 0, 0, static_cast<uint32_t>(rolledSize));
       p->AddInstruction(instruction);
       // std::cout << p->GetName() << " added an instruction\n";
     }
@@ -416,7 +416,7 @@ public:
     int commandAmount = this->ctx.min_ins +
                         rand() % (this->ctx.max_ins - this->ctx.min_ins + 1);
     for (int i = 0; i < commandAmount; i++) {
-      Statement instruction = prosched::GetRandomStatement(name, 3, 0, static_cast<size_t>(memoryBytes));
+      Statement instruction = prosched::GetRandomStatement(name, 0, 0, static_cast<size_t>(memoryBytes));
       p->AddInstruction(instruction);
     }
     return p;
