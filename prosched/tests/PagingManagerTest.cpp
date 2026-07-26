@@ -27,15 +27,23 @@ TEST(PagingManagerConstruction, ValidConfigProducesExpectedFrameCount) {
   EXPECT_EQ(pm.GetTotalFrameCount(), 1024);
 }
 
-// MO2: mem-per-frame is a power of 2, so 0 is an invalid config that should be
-// rejected — not reach an unguarded division by zero (death test contains a crash)
-TEST(PagingManagerConstruction, ZeroMemPerFrameShouldNotCrash) {
+// MO2: an invalid memory config must be reported as an error, not silently
+// succeed. mem-per-frame <= 0 currently calls std::exit(0) (a SUCCESS code) with
+// no message; per the project's config-validation convention it should exit
+// non-zero with an error mentioning the offending parameter. (Death test: the
+// child process must fail, not exit cleanly with 0.)
+TEST(PagingManagerConstruction, ZeroMemPerFrameExitsWithErrorNotSilently) {
   EXPECT_EXIT(
-      {
-        prosched::PagingManager pm(0, 16384);
-        std::exit(0);
-      },
-      ::testing::ExitedWithCode(0), ".*");
+      { prosched::PagingManager pm(0, 16384); (void)pm; },
+      ::testing::ExitedWithCode(1), "mem-per-frame");
+}
+
+// A negative mem-per-frame is likewise invalid and must be reported as an error,
+// not accepted or silently exited with success.
+TEST(PagingManagerConstruction, NegativeMemPerFrameExitsWithErrorNotSilently) {
+  EXPECT_EXIT(
+      { prosched::PagingManager pm(-16, 16384); (void)pm; },
+      ::testing::ExitedWithCode(1), "mem-per-frame");
 }
 
 // MO2: max-overall-mem smaller than mem-per-frame is an invalid config that must
