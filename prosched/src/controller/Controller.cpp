@@ -34,6 +34,12 @@ AlgoContext Controller::initialize() {
   }
 
   this->ctx = AlgoContext::buildConfig(cs);
+
+  if(this->ctx.mem_per_frame <= 0) {
+    std::cerr << "mem-per-frame must be > 0, got " << this->ctx.mem_per_frame << "\n";
+    std::exit(1);
+  }
+
   this->pagingManager = new prosched::PagingManager(this->ctx.mem_per_frame,
                                                     this->ctx.max_overall_mem);
   this->scheduler = new prosched::Scheduler(this->ctx, this->pagingManager);
