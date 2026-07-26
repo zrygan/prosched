@@ -728,20 +728,18 @@ TEST(ProcessMalformedAddressTermination, MalformedWriteAddressTerminatesProcess)
 } // namespace ProcessMalformedAddressTermination
 
 // ─── ProcessMemoryBounds ───────────────────────────────────────────────────
+// NOTE: commit 608910f reverted SetMemoryBounds to void and dropped the
+// start>end guard. In production SetMemoryBounds is always called with start=0
+// (CreateNamedProcess/CreateProcessWithInstructions/generateProcess), so an
+// inverted range is unreachable; we just verify the size is recorded.
 namespace ProcessMemoryBounds {
 
-// Valid bounds (start <= end) are accepted
-TEST(ProcessMemoryBounds, ValidBoundsSucceed) {
+// SetMemoryBounds records the process's memory size (memEnd - memStart)
+TEST(ProcessMemoryBounds, RecordsMemorySize) {
   prosched::Process p("mb_ok", 1, 0);
-  EXPECT_TRUE(p.SetMemoryBounds(0, 0x100));
+  p.SetMemoryBounds(0, 0x100);
+  EXPECT_EQ(p.GetMemorySize(), 0x100u);
   EXPECT_FALSE(p.IsTerminated());
-}
-
-// Inverted bounds (start > end) are rejected and terminate the process
-TEST(ProcessMemoryBounds, InvertedBoundsFailAndTerminate) {
-  prosched::Process p("mb_bad", 2, 0);
-  EXPECT_FALSE(p.SetMemoryBounds(0x100, 0x10));
-  EXPECT_TRUE(p.IsTerminated());
 }
 
 } // namespace ProcessMemoryBounds
