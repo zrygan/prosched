@@ -1474,22 +1474,32 @@ TEST(SchedulerFindTerminatedProcess, ReturnsNullForUnknownName) {
 // divisor is 0 -> rand() % 0 -> SIGFPE (Scheduler.h ~401, also generateProcess).
 namespace SchedulerConfigValidation {
 
-// CreateNamedProcess must not crash when max-ins < min-ins; the child should
-// exit cleanly, not die by SIGFPE.
-TEST(SchedulerConfigValidation, MaxInsBelowMinInsDoesNotCrash) {
+// MO2: config must be validated at STARTUP, not deferred. min-ins > max-ins is a
+// static config error — invalid the moment the config is loaded. It should be
+// rejected while the config is being built / the scheduler constructed (which is
+// what Controller::initialize does at startup), with a clear error and a non-zero
+// exit — NOT silently accepted and left to crash later via rand() % 0 when the
+// first process is created (Scheduler.h:331/401).
+//
+// The fix belongs in Controller::initialize / config validation (the project's
+// test-only validateOrDie already checks max_ins < min_ins; production never
+// calls it). This test drives the earliest testable startup seam: building the
+// config and constructing the scheduler. It reaches std::exit(0) — and so fails
+// the ExitedWithCode(1) expectation — only because nothing rejects the bad range
+// at startup today.
+TEST(SchedulerConfigValidation, InvalidInsRangeRejectedAtStartup) {
   EXPECT_EXIT(
       {
         ConfigStruct *cs = makeDefault();
         cs->min_ins = 100;
-        cs->max_ins = 99; // divisor (max - min + 1) == 0
+        cs->max_ins = 99; // max < min: invalid range
         AlgoContext ctx = AlgoContext::buildConfig(cs);
         delete cs;
         prosched::Scheduler scheduler(ctx);
-        prosched::Process *p = scheduler.CreateNamedProcess("x", 256);
-        (void)p;
-        std::exit(0);
+        (void)scheduler;
+        std::exit(0); // reached only if startup did NOT reject the bad config
       },
-      ::testing::ExitedWithCode(0), ".*");
+      ::testing::ExitedWithCode(1), ".*");
 }
 
 } // namespace SchedulerConfigValidation
