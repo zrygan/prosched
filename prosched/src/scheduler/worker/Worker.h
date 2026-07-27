@@ -230,9 +230,14 @@ public:
     std::lock_guard<std::mutex> lock(workerMutex);
     if (currentProcess != nullptr &&
         currentProcess->GetState() == ProcessState::RUNNING) {
-      currentProcess->IncrementQuantumUsed();
-      return currentProcess->GetQuantumUsed() >= limit;
-    }
+
+          if(currentProcess->GetLastInstructionWasPageFault()) {
+            return false;
+          }
+
+          currentProcess->IncrementQuantumUsed();
+          return currentProcess->GetQuantumUsed() >= limit;
+      }
     return false;
   }
 
@@ -260,7 +265,10 @@ public:
         return;
       }
 
-      p->SetCurrentInstructionCyclesLeft(ctx.delay_per_execution);
+      if(!p->GetLastInstructionWasPageFault()){
+        p->SetCurrentInstructionCyclesLeft(ctx.delay_per_execution);
+      }
+
       return;
     }
 

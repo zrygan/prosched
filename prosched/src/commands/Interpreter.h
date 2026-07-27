@@ -419,7 +419,7 @@ class Interpreter {
    * 
    * @return boolean value if spavce is allocated or not
    */
-  bool Interpreter::CheckSymbolTableAccess();
+  bool CheckSymbolTableAccess();
 
   /** @brief Execute a single AST node.
 

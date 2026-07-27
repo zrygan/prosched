@@ -494,6 +494,12 @@ public:
    * @brief Resets the number of cycles used in the current quantum to zero
    */
   void ResetQuantumUsed() { quantumUsed = 0; }
+
+  /**
+   * @brief Checks if the last executed instruction of the process was a page fault
+   */
+  bool GetLastInstructionWasPageFault() const { return interpreter.GetLastInstructionPageFault(); }
+
 };
 
 } // namespace prosched
