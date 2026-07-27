@@ -35,13 +35,38 @@ AlgoContext Controller::initialize() {
 
   this->ctx = AlgoContext::buildConfig(cs);
 
-  // if (this->ctx.min_ins > this->ctx.max_ins) {
-  //   std::cerr << "Invalid config: min-ins must be lesser than max-ins\n";
-  //   std::exit(1);
-  // }
+  if (this->ctx.num_cpu <= 0 || this->ctx.num_cpu >= 129) {
+    std::cerr << "Invalid config: num-cpu count invalid\n";
+    std::exit(1);
+  }
+
+  if (this->ctx.schedulerType == SchedulerType::UNKNOWN) {
+    std::cerr << "Invalid config: Unknown scheduler type\n";
+    std::exit(1);
+  }
+
+  if (this->ctx.rr_quantum_cycles <= 0) {
+    std::cerr << "Invalid config: Invalid quantum cycles number\n";
+    std::exit(1);
+  }
+
+  if (this->ctx.batch_process_frequency <= 0) {
+    std::cerr << "Invalid config: Invalid batch-process-frequency number\n";
+    std::exit(1);
+  }
+
+  if (this->ctx.min_ins > this->ctx.max_ins) {
+    std::cerr << "Invalid config: min-ins must be lesser than max-ins\n";
+    std::exit(1);
+  }
 
   if(this->ctx.min_mem_per_proc > this->ctx.max_mem_per_proc) {
     std::cerr << "Invalid config: min-mem-per-proc must be lesser than max-mem-per-proc\n";
+    std::exit(1);
+  }
+
+  if (this->ctx.delay_per_execution < 0) {
+    std::cerr << "Invalid config: delay per execution cannot be below 0\n";
     std::exit(1);
   }
 
