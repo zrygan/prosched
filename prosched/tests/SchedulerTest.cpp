@@ -1502,6 +1502,121 @@ TEST(SchedulerConfigValidation, InvalidInsRangeRejectedAtStartup) {
       ::testing::ExitedWithCode(1), ".*");
 }
 
+// ─── validateOrDie's checks, against PRODUCTION ─────────────────────────────
+// ConfigTest.cpp:414 defines `validateOrDie`, a complete 7-check config
+// validator with clear messages and exit(1), covered by 19 green
+// ConfigValidation.* tests. It is `static`, in an anonymous namespace, in the
+// TEST file — `grep validateOrDie src/` returns nothing. So those 19 tests
+// prove the mirror works, not that prosched validates anything.
+//
+// The tests below apply the same checks to real production code. Each corrupts
+// one config field and asserts that constructing a real prosched::Scheduler
+// refuses to proceed, mirroring InvalidInsRangeRejectedAtStartup — the pattern
+// that went green only once a genuine guard landed at Scheduler.h:47.
+//
+// WHY THE SCHEDULER CONSTRUCTOR: it is the only production seam a unit test can
+// hand an arbitrary AlgoContext. Controller::initialize reads the hardcoded
+// path in CONFIG_FILENAME, so injecting a bad config there would mean writing
+// to the repo's real config.txt. If validation is later centralised (e.g. a
+// shared validate() in Config.h called from Controller::initialize), have the
+// Scheduler constructor call it too rather than retargeting these — guarding at
+// the point of use is what the existing min-ins check already does.
+//
+// The requirement being asserted is MO1's documented parameter ranges:
+// num-cpu [1,128], quantum-cycles >= 1, batch-process-freq >= 1,
+// min-ins >= 1, max-ins >= min-ins, delays-per-exec >= 0, scheduler in
+// {fcfs, rr}.
+
+namespace {
+
+// Builds a valid default config, applies one corruption, and asserts the real
+// Scheduler rejects it with exit(1). Reaching exit(0) means nothing validated.
+template <typename Corrupt>
+void ExpectConfigRejectedAtStartup(const char *what, Corrupt corrupt) {
+  SCOPED_TRACE(what);
+  EXPECT_EXIT(
+      {
+        ConfigStruct *cs = makeDefault();
+        corrupt(cs);
+        AlgoContext ctx = AlgoContext::buildConfig(cs);
+        delete cs;
+        prosched::Scheduler scheduler(ctx);
+        (void)scheduler;
+        std::exit(0); // reached only if startup did NOT reject the bad config
+      },
+      ::testing::ExitedWithCode(1), ".*");
+}
+
+} // namespace
+
+// HIGH IMPACT — silent death. num-cpu 0 creates zero workers, so nothing is
+// ever dispatched: the console accepts every command and quietly executes
+// nothing, with no error pointing at the config.
+TEST(SchedulerConfigValidation, NumCpuBelowOneRejectedAtStartup) {
+  ExpectConfigRejectedAtStartup("num-cpu 0", [](ConfigStruct *cs) {
+    cs->num_cpu = 0;
+  });
+}
+
+// MO1 caps num-cpu at 128. Above it, Start() spawns that many real OS threads.
+TEST(SchedulerConfigValidation, NumCpuAboveMaxRejectedAtStartup) {
+  ExpectConfigRejectedAtStartup("num-cpu 129", [](ConfigStruct *cs) {
+    cs->num_cpu = 129;
+  });
+}
+
+// HIGH IMPACT — silent death. A scheduler string that is neither "fcfs" nor
+// "rr" maps to SchedulerType::UNKNOWN, and SchedulerLoop runs neither branch,
+// so no process is ever dispatched.
+//
+// Second defect on this path: AlgoContext::buildConfig sets rr_quantum_cycles
+// only in the fcfs and rr branches (Context.h:29-36). On the UNKNOWN branch it
+// is left uninitialised, and AlgoContext declares it as a plain `int` with no
+// default member initialiser — so reading ctx.rr_quantum_cycles afterwards is
+// undefined behaviour.
+TEST(SchedulerConfigValidation, UnknownSchedulerTypeRejectedAtStartup) {
+  ExpectConfigRejectedAtStartup("scheduler \"bogus\"", [](ConfigStruct *cs) {
+    cs->scheduler = "bogus";
+  });
+}
+
+// HIGH IMPACT — crash. GenerateProcessesCycle does
+// `cpuCycles % ctx.batch_process_frequency` (Scheduler.h:534), so 0 divides by
+// zero and raises SIGFPE. It sits behind `generatingProcesses &&`, so the
+// program boots fine, serves screen -ls / vmstat / process-smi fine, and dies
+// the instant the user types "scheduler-start".
+TEST(SchedulerConfigValidation, ZeroBatchProcessFreqRejectedAtStartup) {
+  ExpectConfigRejectedAtStartup("batch-process-freq 0", [](ConfigStruct *cs) {
+    cs->batch_process_freq = 0;
+  });
+}
+
+// MO1 range is [1, 2^32]. A 0 quantum makes CheckAndIncrementQuantum preempt on
+// every tick (1 >= 0), degenerating to quantum 1 — benign, but out of spec.
+TEST(SchedulerConfigValidation, ZeroQuantumCyclesRejectedAtStartup) {
+  ExpectConfigRejectedAtStartup("quantum-cycles 0", [](ConfigStruct *cs) {
+    cs->scheduler = "rr";
+    cs->rr_quantum_cycles = 0;
+  });
+}
+
+// MO1 range is [1, 2^32]. min-ins 0 yields zero-instruction processes that
+// finish the moment they are dispatched.
+TEST(SchedulerConfigValidation, MinInsBelowOneRejectedAtStartup) {
+  ExpectConfigRejectedAtStartup("min-ins 0", [](ConfigStruct *cs) {
+    cs->min_ins = 0;
+    cs->max_ins = 0; // keep max >= min so this isolates the min-ins check
+  });
+}
+
+// MO1 range is [0, 2^32]. A negative delay makes cyclesLeft start below zero,
+// so TickExecution's `<= 0` test passes immediately every tick.
+TEST(SchedulerConfigValidation, NegativeDelayPerExecRejectedAtStartup) {
+  ExpectConfigRejectedAtStartup("delay-per-exec -1", [](ConfigStruct *cs) {
+    cs->delay_per_exec = -1;
+  });
+}
+
 } // namespace SchedulerConfigValidation
 
 // ─── FOR loops are never generated (MO1 §Process instructions) ──────────────
