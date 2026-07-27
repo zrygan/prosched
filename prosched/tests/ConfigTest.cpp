@@ -252,6 +252,53 @@ TEST(ConfigBuildConfig, UnknownSchedulerMapsToUnknown) {
   EXPECT_EQ(ctx.schedulerType, SchedulerType::UNKNOWN);
 }
 
+// buildConfig must fully initialise what it returns, on every branch.
+// Context.h:29-36 assigns rr_quantum_cycles only in the fcfs branch (-1) and
+// the rr branch (the configured value). The else branch sets schedulerType and
+// nothing more, and AlgoContext declares `int rr_quantum_cycles;` with no
+// default member initialiser — so on an unrecognised scheduler string the
+// field is indeterminate and reading it is undefined behaviour.
+//
+// HOW THIS DETECTS IT: the first call plants a distinctive quantum, and the
+// second call's local AlgoContext generally reuses the same stack slot, so the
+// stale 4242 shows through. That reuse is not guaranteed by the standard — if
+// a future compiler lays the frames out differently this could pass while the
+// bug is still there. It is a detector, not a proof; MSan is the rigorous tool.
+// The real fix is default member initialisers on AlgoContext, after which this
+// passes for the right reason.
+//
+// NOTE: this is defence in depth. The consequence is already covered by
+// SchedulerConfigValidation.UnknownSchedulerTypeRejectedAtStartup — once an
+// unrecognised scheduler string is rejected at startup, nothing in production
+// ever reaches this branch to read the field.
+TEST(ConfigBuildConfig, UnknownSchedulerLeavesQuantumInitialised) {
+  ConfigStruct planted{.num_cpu = 4,
+                       .scheduler = "rr",
+                       .rr_quantum_cycles = 4242,
+                       .batch_process_freq = 1,
+                       .min_ins = 1000,
+                       .max_ins = 2000,
+                       .delay_per_exec = 0};
+  AlgoContext seeded = AlgoContext::buildConfig(&planted);
+  ASSERT_EQ(seeded.rr_quantum_cycles, 4242); // the value is now on the stack
+
+  ConfigStruct unknown{.num_cpu = 4,
+                       .scheduler = "sjf",
+                       .rr_quantum_cycles = 5,
+                       .batch_process_freq = 1,
+                       .min_ins = 1000,
+                       .max_ins = 2000,
+                       .delay_per_exec = 0};
+  AlgoContext ctx = AlgoContext::buildConfig(&unknown);
+
+  ASSERT_EQ(ctx.schedulerType, SchedulerType::UNKNOWN);
+  EXPECT_EQ(ctx.rr_quantum_cycles, -1)
+      << "the UNKNOWN branch left rr_quantum_cycles = " << ctx.rr_quantum_cycles
+      << " (uninitialised; 4242 means it inherited the previous call's stack "
+         "slot). It should be set to -1, the same 'no quantum' sentinel the "
+         "fcfs branch uses";
+}
+
 // batch_process_freq transfers to batch_process_frequency
 TEST(ConfigBuildConfig, Mapsbatch_process_frequency) {
   ConfigStruct cs{.num_cpu = 4,
