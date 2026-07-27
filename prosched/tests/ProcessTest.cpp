@@ -757,6 +757,15 @@ TEST(ProcessMemoryBounds, RecordsMemorySize) {
 //
 // Side effect worth knowing: an unrolled FOR inflates GetTotalInstructions()
 // past the min-ins/max-ins draw, since the count is taken before expansion.
+// That currently breaks SchedulerGenerateProcess.InstructionCountInConfigRange
+// and SchedulerCreateNamedProcess.InstructionCountInRange (MO1 bounds a
+// process's instruction count by min-ins/max-ins). Two valid fixes exist:
+// generate until the STORED count hits the target, or stop unrolling and let
+// Interpreter::ExecuteFor run the loop inside one instruction slot.
+//
+// These tests therefore assert only how many times the BODY RUNS, which holds
+// under either fix. Do not re-add assertions on GetTotalInstructions() here —
+// that would lock in unrolling and block the second option.
 
 namespace ProcessForLoop {
 
@@ -783,9 +792,6 @@ TEST(ProcessForLoop, ForBodyExecutesItsNestedInstructions) {
   prosched::Statement loop = forStmt(3, {printStmt("tick")});
   p.AddInstruction(loop);
 
-  EXPECT_EQ(p.GetTotalInstructions(), 3)
-      << "the loop should be unrolled into one instruction per iteration";
-
   while (!p.IsFinished()) {
     p.ExecuteInstructions(0);
   }
@@ -799,15 +805,25 @@ TEST(ProcessForLoop, ForBodyExecutesItsNestedInstructions) {
   EXPECT_EQ(ticks, 3) << "FOR(..., 3) produced " << ticks << " of 3 iterations";
 }
 
-// Nested FOR: 2 outer × 3 inner = 6 unrolled instructions. MO1 allows nesting
-// up to 3 levels, and AddInstruction recurses, so inner loops expand too.
-TEST(ProcessForLoop, NestedForUnrollsBothLevels) {
+// Nested FOR: 2 outer × 3 inner = 6 executions of the body. MO1 allows nesting
+// up to 3 levels, and the expansion recurses, so inner loops run too.
+TEST(ProcessForLoop, NestedForRunsBodyOncePerCombinedIteration) {
   prosched::Process p("for_nested", 3, 0);
   prosched::Statement inner = forStmt(3, {printStmt("tick")});
   prosched::Statement outer = forStmt(2, {inner});
   p.AddInstruction(outer);
 
-  EXPECT_EQ(p.GetTotalInstructions(), 6);
+  while (!p.IsFinished()) {
+    p.ExecuteInstructions(0);
+  }
+
+  int ticks = 0;
+  for (const std::string &line : p.GetLogs()) {
+    if (line.find("tick") != std::string::npos) {
+      ++ticks;
+    }
+  }
+  EXPECT_EQ(ticks, 6) << "2 outer x 3 inner iterations should run the body 6 times";
 }
 
 // A FOR that only declares/adds must still change process state. Uses the
