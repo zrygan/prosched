@@ -743,3 +743,87 @@ TEST(ProcessMemoryBounds, RecordsMemorySize) {
 }
 
 } // namespace ProcessMemoryBounds
+
+// ─── FOR loops inside a scheduled process (MO1 §Process instructions) ───────
+// MO1/MO2: "FOR([instructions], repeats) — For-loop, nestable up to 3 levels."
+//
+// Process does NOT run FOR through Interpreter::ExecuteFor. AddInstruction
+// (Process.h:114-133) UNROLLS the loop at add time, recursively appending the
+// body `repeats` times, so a FOR never reaches the statements vector at all
+// and each unrolled instruction costs its own CPU tick. (The kFor branch in
+// ExecuteInstructions is therefore dead code.) Unrolling is behaviourally
+// equivalent here — none of the instruction types have loop-carried control
+// flow — but it was completely untested, so these pin it down.
+//
+// Side effect worth knowing: an unrolled FOR inflates GetTotalInstructions()
+// past the min-ins/max-ins draw, since the count is taken before expansion.
+
+namespace ProcessForLoop {
+
+static prosched::Statement forStmt(int repeats,
+                                   std::vector<prosched::Statement> body) {
+  prosched::Statement s;
+  s.keyword = prosched::Keyword::kFor;
+  s.args = {"", std::to_string(repeats)};
+  s.nested = std::move(body);
+  return s;
+}
+
+static prosched::Statement printStmt(const std::string &literal) {
+  prosched::Statement s;
+  s.keyword = prosched::Keyword::kPrint;
+  s.args = {"\"" + literal + "\""};
+  return s;
+}
+
+// FOR(..., 3) around one PRINT runs the body 3 times — as 3 separate
+// instructions, each taking its own ExecuteInstructions call.
+TEST(ProcessForLoop, ForBodyExecutesItsNestedInstructions) {
+  prosched::Process p("for_body", 1, 0);
+  prosched::Statement loop = forStmt(3, {printStmt("tick")});
+  p.AddInstruction(loop);
+
+  EXPECT_EQ(p.GetTotalInstructions(), 3)
+      << "the loop should be unrolled into one instruction per iteration";
+
+  while (!p.IsFinished()) {
+    p.ExecuteInstructions(0);
+  }
+
+  int ticks = 0;
+  for (const std::string &line : p.GetLogs()) {
+    if (line.find("tick") != std::string::npos) {
+      ++ticks;
+    }
+  }
+  EXPECT_EQ(ticks, 3) << "FOR(..., 3) produced " << ticks << " of 3 iterations";
+}
+
+// Nested FOR: 2 outer × 3 inner = 6 unrolled instructions. MO1 allows nesting
+// up to 3 levels, and AddInstruction recurses, so inner loops expand too.
+TEST(ProcessForLoop, NestedForUnrollsBothLevels) {
+  prosched::Process p("for_nested", 3, 0);
+  prosched::Statement inner = forStmt(3, {printStmt("tick")});
+  prosched::Statement outer = forStmt(2, {inner});
+  p.AddInstruction(outer);
+
+  EXPECT_EQ(p.GetTotalInstructions(), 6);
+}
+
+// A FOR that only declares/adds must still change process state. Uses the
+// interpreter's own view so it does not depend on log formatting.
+TEST(ProcessForLoop, ForBodyAffectsInterpreterState) {
+  prosched::Process p("for_state", 2, 0);
+  prosched::Statement declare;
+  declare.keyword = prosched::Keyword::kDeclare;
+  declare.args = {"counter", "7"};
+  prosched::Statement loop = forStmt(1, {declare});
+  p.AddInstruction(loop);
+
+  p.ExecuteInstructions(0);
+
+  EXPECT_FALSE(p.GetInterpreter().ExecuteDebug().empty())
+      << "a DECLARE nested in a FOR never ran, so the symbol table is empty";
+}
+
+} // namespace ProcessForLoop
