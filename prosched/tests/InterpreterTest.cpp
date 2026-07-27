@@ -169,6 +169,51 @@ TEST(InterpreterExecutePrint, EmptyConcatLeftPartDoesNotCrash) {
       ::testing::ExitedWithCode(0), ".*");
 }
 
+
+// The SECOND trigger for the same defect, on the OTHER branch. The test above
+// covers the concat path (Interpreter.cpp:636, str_part.front()). An empty
+// argument with no '+' reaches the else-branch instead
+// (Interpreter.cpp:640, arg.front()), which is a separate unguarded call.
+//
+// Both "PRINT()" and "PRINT( )" produce args[0] == "": ExtractArgs computes
+// end == offset for kPrint, so it pushes an empty trimmed substring rather
+// than pushing nothing. ExecuteStatement's `!stmt.args.empty()` guard does not
+// help, because there IS one argument and it is empty.
+//
+// VERIFIED reachable end-to-end: ParseUserProgram accepts both (one arg, arity
+// matches), so `screen -c p 64 "PRINT()"` creates a process that aborts the
+// whole emulator with SIGABRT (exit 134) when the instruction runs.
+TEST(InterpreterExecutePrint, EmptyArgumentDoesNotCrash) {
+  EXPECT_EXIT(
+      {
+        prosched::Interpreter interp;
+        interp.ExecuteString("PRINT()");
+        std::exit(0);
+      },
+      ::testing::ExitedWithCode(0), ".*");
+}
+
+TEST(InterpreterExecutePrint, WhitespaceOnlyArgumentDoesNotCrash) {
+  EXPECT_EXIT(
+      {
+        prosched::Interpreter interp;
+        interp.ExecuteString("PRINT( )");
+        std::exit(0);
+      },
+      ::testing::ExitedWithCode(0), ".*");
+}
+
+// Both forms must also be rejected by the screen -c gate rather than becoming
+// a process in the first place — a program that cannot execute should never be
+// admitted. (Either fix closes the hole; this records the gate's behaviour.)
+TEST(InterpreterExecutePrint, EmptyPrintArgumentIsRejectedByTheUserProgramGate) {
+  prosched::Interpreter interp;
+  std::vector<prosched::Statement> out;
+  EXPECT_FALSE(interp.ParseUserProgram("PRINT()", out))
+      << "screen -c admitted PRINT() as a valid program; executing it aborts "
+         "the emulator";
+}
+
 } // namespace InterpreterExecutePrint
 
 // ─── ExecuteDeclare
@@ -1251,3 +1296,67 @@ TEST(StatementGeneratedAddresses, GeneratedForNestingNeverExceedsThreeLevels) {
 }
 
 } // namespace StatementGeneratedAddresses
+
+
+// ─── DECLARE value clamping ──────────────────────────────────────────────────
+//
+// MO2, verbatim: "uint16 variables are clamped between (0, max(uint16)) and
+// consume 2 bytes of memory."
+//
+// ExecuteDeclare does clamp (Interpreter.cpp:655-657) — but only once
+// std::stol has succeeded, and that stol is UNGUARDED. A value larger than
+// LONG_MAX throws std::out_of_range before the clamp is ever reached.
+//
+// This is the LAST surviving member of the unguarded-sto* family. The others
+// were all fixed: ResolveOperand and ExecuteSleep now catch and clamp, and
+// WRITE's value path clamps correctly — MEASURED, same 23-digit input:
+//     WRITE 0x10 99999999999999999999999  -> 65535   (correct)
+//     DECLARE a  99999999999999999999999  -> THROWS  (wrong)
+// In the normal pipeline ExecuteStatement's try/catch swallows the throw, so
+// the failure is silent: the variable is simply never declared, and the
+// process carries on with it missing.
+namespace InterpreterDeclareClamping {
+
+TEST(InterpreterDeclareClamping, ValueExceedingLongClampsInsteadOfThrowing) {
+  prosched::Interpreter interp;
+  const std::string huge = "99999999999999999999999"; // > LONG_MAX
+
+  std::optional<uint16_t> result;
+  ASSERT_NO_THROW(result = interp.ExecuteDeclare(
+                      makeStmt(prosched::Keyword::kDeclare, {"a", huge})))
+      << "ExecuteDeclare threw on an out-of-range literal; MO2 requires the "
+         "value to be clamped to max(uint16)";
+  ASSERT_TRUE(result.has_value()) << "no value was declared";
+  EXPECT_EQ(*result, 65535);
+}
+
+// Contrast, and the reason this is a defect rather than a design choice: the
+// identical input on the WRITE path is clamped correctly.
+TEST(InterpreterDeclareClamping, WritePathAlreadyClampsTheSameInput) {
+  prosched::Interpreter interp;
+  const std::string huge = "99999999999999999999999";
+
+  std::optional<std::pair<uint32_t, uint16_t>> written;
+  ASSERT_NO_THROW(written = interp.ExecuteWrite(
+                      makeStmt(prosched::Keyword::kWrite, {"0x10", huge})));
+  ASSERT_TRUE(written.has_value());
+  EXPECT_EQ(written->second, 65535)
+      << "control: WRITE clamps, so DECLARE clamping is the expected behaviour";
+}
+
+// End-to-end: through ExecuteString the throw is swallowed, so the variable is
+// silently absent rather than clamped — the process keeps running with a
+// missing variable and only an "[!] Interpreter Error" line to show for it.
+TEST(InterpreterDeclareClamping, PipelineSilentlyDropsTheVariable) {
+  prosched::Interpreter interp;
+  interp.ExecuteString("DECLARE(a, 99999999999999999999999)");
+  interp.FlushBuffer();
+
+  auto mem = interp.ExecuteDebug();
+  ASSERT_NE(mem.find("a"), mem.end())
+      << "DECLARE with an out-of-range value declared no variable at all; "
+         "MO2 requires it to be clamped to 65535";
+  EXPECT_EQ(mem["a"], 65535);
+}
+
+} // namespace InterpreterDeclareClamping
