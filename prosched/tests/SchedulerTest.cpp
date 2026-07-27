@@ -1503,3 +1503,53 @@ TEST(SchedulerConfigValidation, InvalidInsRangeRejectedAtStartup) {
 }
 
 } // namespace SchedulerConfigValidation
+
+// ─── FOR loops are never generated (MO1 §Process instructions) ──────────────
+// MO1 lists FOR as one of the six instruction types a generated process draws
+// from, "nestable up to 3 levels". Statement.cpp drops kFor from the pool when
+// `max_depth >= kMaxNestingDepth` (3) — correct for recursion — but BOTH
+// production call sites pass 3 as the INITIAL depth (Scheduler.h:350 in
+// generateProcess, :419 in CreateNamedProcess). The pool is therefore already
+// at max depth on the first call, so FOR is excluded from every top-level
+// draw and a generated process contains zero loops. The initial call should
+// pass 0.
+
+namespace SchedulerForGeneration {
+
+// Observed via the instruction count, not by scanning for kFor: AddInstruction
+// UNROLLS a FOR into `repeats` copies of its body, so a kFor never survives
+// into the statements vector even when one is generated. With min-ins ==
+// max-ins == 500 the draw is exactly 500 statements, so any FOR among them
+// pushes the stored total above 500. It stays at exactly 500 today because no
+// FOR is ever drawn.
+//
+// NOTE for whoever fixes this: the fix is the initial depth at the two call
+// sites (3 -> 0), NOT removing the `max_depth >= kMaxNestingDepth` guard —
+// that guard is correct and is covered by
+// InterpreterGetRandomStatement.NeverReturnsForAtMaxDepth. This test also
+// assumes unrolling stays; if FOR is ever changed to execute via
+// Interpreter::ExecuteFor instead, retarget it rather than deleting it.
+TEST(SchedulerForGeneration, GeneratedProcessCanContainForLoops) {
+  ConfigStruct *cs = makeDefault();
+  cs->scheduler = "fcfs";
+  cs->batch_process_freq = 1000000;
+  cs->min_ins = 500;
+  cs->max_ins = 500;
+  AlgoContext ctx = AlgoContext::buildConfig(cs);
+  delete cs;
+
+  prosched::Scheduler scheduler(ctx);
+  prosched::Process *p = scheduler.CreateNamedProcess("for_gen", 256);
+  ASSERT_NE(p, nullptr);
+
+  EXPECT_GT(p->GetTotalInstructions(), 500)
+      << "500 drawn instructions produced exactly "
+      << p->GetTotalInstructions()
+      << " stored instructions, so no FOR was ever generated: both call sites "
+         "pass max_depth=3 (== kMaxNestingDepth), which removes kFor from the "
+         "pool before the very first draw";
+
+  delete p;
+}
+
+} // namespace SchedulerForGeneration
