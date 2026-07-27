@@ -1,6 +1,9 @@
 #include "memory/PagingManager.h"
 #include "commands/Interpreter.h"
+#include <chrono>
+#include <cstdio>
 #include <gtest/gtest.h>
+#include <iostream>
 
 static prosched::Statement pmWrite(const std::string &addr,
                                    const std::string &val) {
@@ -236,3 +239,104 @@ TEST(PagingManagerBackingStore, TwoPageInstructionCompletesWithOneFrame) {
 }
 
 } // namespace PagingManagerBackingStore
+
+// ─── Backing-store write cost (performance, not correctness) ────────────────
+// PagingManager::PersistBackingStoreToFile (PagingManager.h:440-450) opens the
+// file with ios::trunc and rewrites EVERY entry, and it is called on every
+// eviction (WritePageToBackingStore) AND on every restore
+// (ReadPageFromBackingStore) — two full rewrites per page fault, all while
+// pagingMutex is held and the scheduler is blocked at the tick barrier.
+//
+// TWO separate costs are in play, and the measurements say the SECOND one is
+// what actually hurts:
+//
+// (a) O(N) rewrite — the store grows by one entry per evicted-and-not-restored
+//     page, so each write copies everything already there. Measured with -O2 on
+//     a native Linux filesystem (/tmp), 1 frame, N sequential PageIns:
+//         n=250   251 us/eviction     n=1000  315 us/eviction
+//         n=500   217 us/eviction     n=2000  393 us/eviction
+//     Real, but gentle — roughly 1.8x per-item cost for 4x the data.
+//
+// (b) Fixed per-write I/O — and this dominates by a wide margin. The same
+//     measurement run from THIS repo's working directory:
+//         n=500  8662 us/eviction     n=2000 10194 us/eviction
+//     ~40x slower, and the growth ratio collapses to 1.18 because the constant
+//     term swamps everything. The repo lives on /mnt/e, a Windows drive mounted
+//     through WSL, where every open/truncate/flush crosses the 9p boundary.
+//     At ~9 ms per eviction and two rewrites per fault, ~8 faults per tick puts
+//     a tick at well over 100 ms — a handful of ticks per second.
+//
+// So the headline is not "the algorithm is quadratic", it is "a page fault does
+// synchronous whole-file disk I/O twice, while holding pagingMutex with the
+// scheduler blocked at the tick barrier". On the demo machine that is seconds
+// of stall per hundred faults, which is almost certainly why the app looks
+// frozen during demo 2's 30-second wait.
+//
+// Fixes, cheapest first: stop persisting on every eviction (keep the map in
+// memory, flush on demand — MO2 only requires the file be readable "any time");
+// or append-only; or one file per page.
+//
+// WHY DISABLED: this is a stopwatch. Wall-clock assertions flake, and the
+// numbers swing 40x with the filesystem the repo sits on. It lives here so the
+// measurement is repeatable and reviewed, not so CI can fail on it. Run it
+// deliberately:
+//
+//     ./build/prosched/prosched_tests \
+//         --gtest_also_run_disabled_tests \
+//         --gtest_filter='*BackingStorePerf*'
+
+namespace PagingManagerBackingStorePerf {
+
+// Returns microseconds per eviction for `pageCount` sequential page-ins
+// through a single frame — every one of them evicts its predecessor.
+static double MicrosPerEviction(int pageCount) {
+  std::remove("csopesy-backing-store.txt");
+  prosched::PagingManager pm(16, 16); // exactly ONE frame
+  prosched::Interpreter interp;
+  interp.SetMemoryBounds(0, 1u << 20);
+  interp.SetPageSize(16);
+  pm.RegisterProcessInterpreter(1, &interp);
+
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < pageCount; ++i) {
+    pm.PageIn(1, i);
+  }
+  const auto end = std::chrono::steady_clock::now();
+
+  const double ms =
+      std::chrono::duration<double, std::milli>(end - start).count();
+  return ms / pageCount * 1000.0;
+}
+
+TEST(PagingManagerBackingStorePerf, DISABLED_PageFaultDoesNotCostDiskIo) {
+  MicrosPerEviction(50); // warm the filesystem cache
+
+  const double small = MicrosPerEviction(150);
+  const double large = MicrosPerEviction(600);
+  std::remove("csopesy-backing-store.txt");
+
+  std::cout << "  n=150  " << small << " us/eviction\n"
+            << "  n=600  " << large << " us/eviction\n"
+            << "  growth " << (large / small) << "x\n";
+
+  // The number that decides whether the demo looks responsive. A page fault is
+  // supposed to be a memory operation; anything in the millisecond range means
+  // it is really a synchronous whole-file disk write. Scale it up: ~8 faults
+  // per tick across 8 cores, two rewrites each.
+  //
+  // Filesystem-dependent by nature — ~200 us on a native Linux disk, ~9000 us
+  // from a WSL-mounted Windows drive. The point is to put the real number in
+  // front of whoever runs it, not to defend a universal constant.
+  EXPECT_LT(large, 1000.0)
+      << "each eviction costs " << large
+      << " us of synchronous disk I/O (two full rewrites of the backing store "
+         "per fault, holding pagingMutex while the scheduler waits at the tick "
+         "barrier)";
+
+  // Secondary: the O(N) rewrite. Near 1.0 if cost is independent of store size.
+  EXPECT_LT(large / small, 1.5)
+      << "per-eviction cost grew when the store got 4x bigger, so every "
+         "eviction is paying for the entries already in the file";
+}
+
+} // namespace PagingManagerBackingStorePerf

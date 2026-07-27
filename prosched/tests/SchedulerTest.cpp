@@ -1668,3 +1668,63 @@ TEST(SchedulerForGeneration, GeneratedProcessCanContainForLoops) {
 }
 
 } // namespace SchedulerForGeneration
+
+// ─── What a finished process keeps alive (footprint, not correctness) ───────
+// Scheduler::processes never shrinks, and that is CORRECT — MO1 requires
+// finished processes to stay listed in screen -ls / report-util. The waste is
+// what each finished process still holds: its entire `statements` vector, which
+// is needed only while it is running. The report needs a name, timestamps and
+// two counts.
+//
+// This is a MEASUREMENT, not a pass/fail assertion, and it is DISABLED for that
+// reason. It cannot be a real test today: GetTotalInstructions() returns
+// statements.size(), so a test has no way to tell "instructions released" from
+// "process had none". Caching the count in an int and clearing the vector on
+// completion would fix the footprint AND make this assertable — at which point
+// this becomes: after finishing, retained statements == 0 while
+// GetTotalInstructions() still reports the original count.
+//
+// Run it deliberately:
+//   ./build/prosched/prosched_tests --gtest_also_run_disabled_tests \
+//       --gtest_filter='*RetentionPerf*'
+
+namespace SchedulerRetentionPerf {
+
+TEST(SchedulerRetentionPerf, DISABLED_FinishedProcessesReleaseTheirInstructions) {
+  const int kProcesses = 200;
+  const int kInstructions = 1000; // demo 2 uses min-ins == max-ins == 1000
+
+  ConfigStruct *cs = makeDefault();
+  cs->scheduler = "fcfs";
+  cs->batch_process_freq = 1000000;
+  cs->min_ins = kInstructions;
+  cs->max_ins = kInstructions;
+  AlgoContext ctx = AlgoContext::buildConfig(cs);
+  delete cs;
+
+  prosched::Scheduler scheduler(ctx);
+  long retained = 0;
+  for (int i = 0; i < kProcesses; ++i) {
+    prosched::Process *p =
+        scheduler.CreateNamedProcess("held" + std::to_string(i), 1024);
+    p->SetState(prosched::ProcessState::FINISHED);
+    retained += p->GetTotalInstructions();
+    scheduler.AddProcess(p); // scheduler owns and frees it
+  }
+
+  // Rough lower bound: each Statement is at least its own size, and every one
+  // owns a vector<string> of arguments whose heap blocks are not counted here.
+  const long bytes = retained * static_cast<long>(sizeof(prosched::Statement));
+  std::cout << "  " << kProcesses << " finished processes retain " << retained
+            << " Statement objects, >= " << (bytes / 1024 / 1024) << " MiB\n"
+            << "  (demo 2 generates one process per tick for 10 s, so this is a"
+               " small fraction of the real total)\n";
+
+  EXPECT_EQ(retained, 0)
+      << retained
+      << " instructions are still held by processes that already finished; "
+         "only the name, timestamps and instruction counts are needed for the "
+         "screen -ls / report-util listing";
+}
+
+} // namespace SchedulerRetentionPerf
