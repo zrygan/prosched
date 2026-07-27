@@ -1728,3 +1728,80 @@ TEST(SchedulerRetentionPerf, DISABLED_FinishedProcessesReleaseTheirInstructions)
 }
 
 } // namespace SchedulerRetentionPerf
+
+// ─── PID uniqueness under concurrent creation ───────────────────────────────
+// GenerateProcessesCycle reads nextPID WITHOUT holding schedulerMutex
+// (Scheduler.h:535), hands it to generateProcess — which then spends
+// milliseconds building min_ins..max_ins statements — and only increments it
+// under the lock afterwards. CreateNamedProcess (the screen -s path) reads and
+// increments under the lock. So a screen -s issued while the scheduler is
+// generating can be handed the SAME pid the generator is already using:
+//
+//   scheduler thread: reads nextPID == 5, starts building 1000 statements ...
+//   CLI thread:       locks, takes pid 5, sets nextPID = 6
+//   scheduler thread: finishes, locks, stores its process as pid 5, nextPID = 7
+//
+// Two live processes now share pid 5, and pid 6 is never used.
+//
+// WHY IT MATTERS: PagingManager keys everything by pid — pageTables,
+// processInterpreters, and backing-store entries. Two processes on one pid
+// share a page table, and the second RegisterProcessInterpreter overwrites the
+// first, so one process's READ/WRITE lands in the other's address space.
+// FreeAllPagesForProcess then frees both at once. This is reachable by an
+// ordinary demo action: typing screen -s while scheduler-start is running.
+//
+// generateProcess also reads nextPID a SECOND time, unlocked, to build the
+// process NAME (Scheduler.h:333), so a process can be named "processN" while
+// carrying pid N-1.
+//
+// The window is milliseconds wide because generateProcess builds every
+// statement before taking the lock, so this reproduces reliably rather than
+// rarely. Fix: take schedulerMutex once and claim the pid before generating,
+// exactly as CreateNamedProcess already does.
+
+namespace SchedulerPidUniqueness {
+
+TEST(SchedulerPidUniqueness, ConcurrentCreationNeverReusesAPid) {
+  ConfigStruct *cs = makeDefault();
+  cs->scheduler = "fcfs";
+  cs->num_cpu = 2;
+  cs->batch_process_freq = 1; // generate every tick
+  cs->min_ins = 300;          // wide enough window to hit the race
+  cs->max_ins = 300;
+  AlgoContext ctx = AlgoContext::buildConfig(cs);
+  delete cs;
+
+  prosched::PagingManager pm(16, 4096);
+  prosched::Scheduler scheduler(ctx, &pm);
+  scheduler.Start();
+  scheduler.ResumeGenerating();
+
+  // Interleave screen -s style creation with the generator.
+  for (int i = 0; i < 25; ++i) {
+    prosched::Process *p =
+        scheduler.CreateNamedProcess("named" + std::to_string(i), 256);
+    scheduler.AddProcess(p);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+
+  scheduler.StopGenerating();
+  scheduler.Stop();
+
+  std::vector<int> pids;
+  for (prosched::Process *p : scheduler.GetAllProcesses()) {
+    if (p != nullptr) {
+      pids.push_back(p->GetPID());
+    }
+  }
+  std::sort(pids.begin(), pids.end());
+  const auto dup = std::adjacent_find(pids.begin(), pids.end());
+
+  EXPECT_EQ(dup, pids.end())
+      << "pid " << (dup == pids.end() ? -1 : *dup)
+      << " was handed to two live processes: GenerateProcessesCycle reads "
+         "nextPID outside schedulerMutex, so screen -s can claim the same pid "
+         "while a batch process is still being built. PagingManager keys page "
+         "tables by pid, so the two would share memory";
+}
+
+} // namespace SchedulerPidUniqueness
