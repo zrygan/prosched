@@ -370,30 +370,30 @@ public:
    * @return total number of instrcutions in a process
    */
   int GetTotalInstructions() {
-    // return (int)statements.size();
+    return (int)statements.size();
 
-    int total = 0;
-    for (const auto &stmt : statements) {
-      if (stmt.keyword == Keyword::kFor) {
-        total += 1;
+    // int total = 0;
+    // for (const auto &stmt : statements) {
+    //   if (stmt.keyword == Keyword::kFor) {
+    //     total += 1;
 
-        int m = 1;
-        if (stmt.args.size() >= 2) {
-          try {
-            m = std::stoi(stmt.args[1]);
-          } catch (...) {
-            m = 1;
-          }
-        }
+    //     int m = 1;
+    //     if (stmt.args.size() >= 2) {
+    //       try {
+    //         m = std::stoi(stmt.args[1]);
+    //       } catch (...) {
+    //         m = 1;
+    //       }
+    //     }
 
-        int n = (int)stmt.nested.size();
+    //     int n = (int)stmt.nested.size();
 
-        total += (m * n);
-      } else {
-        total += 1;
-      }
-    }
-    return total;
+    //     total += (m * n);
+    //   } else {
+    //     total += 1;
+    //   }
+    // }
+    // return total;
   }
 
   /**
