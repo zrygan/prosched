@@ -256,6 +256,9 @@ public:
     }
 
     backingStore[{pid, pageNum}] = serialized.str();
+
+    interpreterIt->second->ClearPageRange(
+        pageBase, static_cast<uint32_t>(memPerFrame));
     PersistBackingStoreToFile();
   }
 
