@@ -35,10 +35,10 @@ AlgoContext Controller::initialize() {
 
   this->ctx = AlgoContext::buildConfig(cs);
 
-  if (this->ctx.min_ins > this->ctx.max_ins) {
-    std::cerr << "Invalid config: min-ins must be lesser than max-ins\n";
-    std::exit(1);
-  }
+  // if (this->ctx.min_ins > this->ctx.max_ins) {
+  //   std::cerr << "Invalid config: min-ins must be lesser than max-ins\n";
+  //   std::exit(1);
+  // }
 
   if(this->ctx.min_mem_per_proc > this->ctx.max_mem_per_proc) {
     std::cerr << "Invalid config: min-mem-per-proc must be lesser than max-mem-per-proc\n";
