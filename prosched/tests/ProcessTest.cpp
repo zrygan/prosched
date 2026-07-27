@@ -1,5 +1,7 @@
 #include "scheduler/process/Process.h"
+#include <functional>
 #include <gtest/gtest.h>
+#include <set>
 
 // Helper: parse a raw instruction string and add each resulting Statement.
 static void AddRaw(prosched::Process &p, const std::string &src) {
@@ -843,3 +845,226 @@ TEST(ProcessForLoop, ForBodyAffectsInterpreterState) {
 }
 
 } // namespace ProcessForLoop
+
+// ─── Fault atomicity ─────────────────────────────────────────────────────────
+//
+// MO2: "page fault handling continuously occurs until a valid page is found
+// ... before an instruction is performed." An instruction that reports a page
+// fault has NOT been performed, so it must leave no trace: the process retries
+// it, and the retry must produce exactly the state a single clean execution
+// would have.
+//
+// Every test here installs a REALISTIC pager: a page faults the first time it
+// is consulted and is resident from then on. That is exactly what
+// Scheduler::attachPaging installs (IsPageResident ? false : PageIn(...)).
+// It matters, because the symbol-table segment is consulted MORE THAN ONCE
+// inside a single ADD/SUBTRACT/PRINT — once per ResolveOperand that has to
+// auto-declare, and once for the destination SetVariable. The first consult
+// faults and pages the segment in; the second therefore succeeds and COMMITS,
+// while the fault flag from the first is still latched.
+namespace ProcessFaultAtomicity {
+
+// Faults once per page, then reports it resident — the production handler.
+static std::function<bool(int)> faultOncePerPage(std::set<int> *resident) {
+  return [resident](int pageNum) {
+    if (resident->count(pageNum) != 0) {
+      return false; // already paged in, no fault
+    }
+    resident->insert(pageNum);
+    return true; // not resident -> fault, and page it in
+  };
+}
+
+// Sized like the MO2 demo config: 1024-byte process over 256-byte frames.
+static void EnablePaging(prosched::Process &p, std::set<int> *resident) {
+  p.SetMemoryBounds(0, 1024);
+  p.GetInterpreter().SetPageSize(256);
+  p.GetInterpreter().SetPageFaultHandler(faultOncePerPage(resident));
+}
+
+static void AddStmt(prosched::Process &p, prosched::Keyword kw,
+                    std::vector<std::string> args) {
+  prosched::Statement s;
+  s.keyword = kw;
+  s.args = std::move(args);
+  p.AddInstruction(s);
+}
+
+// Drives the real retry loop: Process does not advance its instruction index
+// while the fault flag is set, so this keeps ticking until the process retires.
+static void RunToCompletion(prosched::Process &p, int max_ticks = 20) {
+  for (int i = 0; i < max_ticks && !p.IsFinished(); ++i) {
+    p.ExecuteInstructions(0);
+  }
+}
+
+static uint16_t VarValue(prosched::Process &p, const std::string &name) {
+  auto mem = p.GetInterpreter().ExecuteDebug();
+  auto it = mem.find(name);
+  return it == mem.end() ? 0 : it->second;
+}
+
+// ADD(varA, varA, 5) on a fresh process, symbol segment not resident.
+// One execution of this instruction means: varA is auto-declared to 0, then
+// varA = 0 + 5 = 5. The instruction faults, so it is retried — and the retry
+// must still leave varA == 5.
+TEST(ProcessFaultAtomicity, SelfReferentialAddIsNotAppliedTwiceAcrossARetry) {
+  prosched::Process p("fault_add", 1, 0);
+  std::set<int> resident;
+  EnablePaging(p, &resident);
+  AddStmt(p, prosched::Keyword::kAdd, {"varA", "varA", "5"});
+
+  RunToCompletion(p);
+
+  ASSERT_TRUE(p.IsFinished()) << "instruction never retired";
+  EXPECT_EQ(VarValue(p, "varA"), 5)
+      << "ADD(varA, varA, 5) was applied twice: the attempt that reported a "
+         "page fault still committed varA, then the retry added 5 again";
+}
+
+// Same defect, with SUBTRACT the corruption is unmistakable because the
+// operation is not idempotent in either direction.
+// One execution: varA auto-declared 0, varA = 0 - 5 = 65531 (uint16 wrap).
+TEST(ProcessFaultAtomicity,
+     SelfReferentialSubtractIsNotAppliedTwiceAcrossARetry) {
+  prosched::Process p("fault_sub", 2, 0);
+  std::set<int> resident;
+  EnablePaging(p, &resident);
+  AddStmt(p, prosched::Keyword::kSubtract, {"varA", "varA", "5"});
+
+  RunToCompletion(p);
+
+  ASSERT_TRUE(p.IsFinished()) << "instruction never retired";
+  EXPECT_EQ(VarValue(p, "varA"), 65531)
+      << "SUBTRACT(varA, varA, 5) was applied twice: 5 was subtracted once by "
+         "the faulting attempt and again by the retry";
+}
+
+// The invariant itself, stated directly and without relying on an operation
+// being non-idempotent: after a SINGLE attempt that reports a page fault, the
+// instruction must have changed nothing at all.
+//
+// ADD(dst, src, 5) with both undeclared and the symbol segment not resident.
+// ResolveOperand("src") auto-declares, which consults the pager and faults —
+// and that fault PAGES THE SEGMENT IN. So the destination SetVariable a few
+// lines later finds the segment resident, succeeds, and writes dst, even
+// though the instruction is about to report a fault and be retried.
+TEST(ProcessFaultAtomicity, FaultingAddCommitsNothingBeforeItsRetry) {
+  prosched::Process p("fault_partial", 3, 0);
+  std::set<int> resident;
+  EnablePaging(p, &resident);
+  AddStmt(p, prosched::Keyword::kAdd, {"dst", "src", "5"});
+
+  p.ExecuteInstructions(0); // exactly one attempt
+
+  ASSERT_TRUE(p.GetLastInstructionWasPageFault())
+      << "precondition: this attempt must have faulted";
+  ASSERT_EQ(p.GetCurrentInstructionIndex(), 0)
+      << "precondition: a faulting instruction must not advance the index";
+
+  auto mem = p.GetInterpreter().ExecuteDebug();
+  EXPECT_EQ(mem.count("dst"), 0u)
+      << "the attempt reported a page fault but had already written its "
+         "destination variable; the pending retry will apply the instruction a "
+         "second time on top of that";
+}
+
+// The Process side of the same invariant. Process::ExecuteInstructions checks
+// the fault flag to decide whether to advance the instruction index
+// (Process.h:218) but then flushes the interpreter's screen buffer
+// UNCONDITIONALLY (Process.h:222) — so output produced by an attempt that
+// faulted is committed to the logs, and the retry logs it a second time.
+// One PRINT instruction must produce exactly one log line.
+TEST(ProcessFaultAtomicity, FaultingPrintIsNotLoggedTwice) {
+  prosched::Process p("fault_print", 4, 0);
+  std::set<int> resident;
+  EnablePaging(p, &resident);
+  AddStmt(p, prosched::Keyword::kPrint, {"\"x=\" + varA"});
+
+  RunToCompletion(p);
+
+  ASSERT_TRUE(p.IsFinished()) << "instruction never retired";
+  EXPECT_EQ(p.GetLogs().size(), 1u)
+      << "one PRINT produced " << p.GetLogs().size()
+      << " log lines: the faulting attempt's output was flushed to the logs "
+         "instead of being discarded and re-produced by the retry";
+}
+
+} // namespace ProcessFaultAtomicity
+
+// ─── screen -c FOR body reaches the process ──────────────────────────────────
+//
+// Companion to InterpreterParseUserProgramForBody (InterpreterTest.cpp), which
+// shows ParseUserProgram does not validate FOR bodies. These confirm the
+// consequence rather than assuming it: AddInstruction unrolls the FOR at add
+// time, so whatever slipped through the gate becomes real instructions.
+namespace ProcessForBodyFromUserProgram {
+
+// The unrecognised nested instruction is not merely parsed — it is unrolled
+// into the process once per repeat and executed, logging a warning each time.
+TEST(ProcessForBodyFromUserProgram, UnknownInstructionInForBodyBecomesExecutable) {
+  prosched::Interpreter parser;
+  std::vector<prosched::Statement> program;
+  ASSERT_TRUE(parser.ParseUserProgram("FOR([BOGUS(1)], 3)", program))
+      << "precondition: the gate accepts this program (that is the bug under "
+         "test in InterpreterParseUserProgramForBody)";
+
+  prosched::Process p("bad_for_body", 1, 0);
+  for (auto &s : program)
+    p.AddInstruction(s);
+
+  EXPECT_EQ(p.GetTotalInstructions(), 0)
+      << "the unrecognised body was unrolled into "
+      << p.GetTotalInstructions()
+      << " executable instructions; a program that never should have become a "
+         "process now runs garbage";
+
+  for (int i = 0; i < 10 && !p.IsFinished(); ++i)
+    p.ExecuteInstructions(0);
+
+  for (const auto &line : p.GetLogs()) {
+    EXPECT_EQ(line.find("Unrecognized instruction"), std::string::npos)
+        << "process log contains an unrecognised-instruction warning, which "
+           "surfaces in screen -r: " << line;
+  }
+}
+
+// Measurement, not a gate: AddInstruction unrolls FOR multiplicatively, so a
+// single screen -c instruction expands to repeats^depth statements. This is at
+// 3 nesting levels — the depth the spec ALLOWS — so it is not fixed by
+// bounding nesting alone; the repeat count is unbounded too.
+//
+// MEASURED (-O2, this machine), one user instruction each time:
+//   R=10 ->      1,000 stored,   0.2 MB
+//   R=30 ->     27,000 stored,   2.8 MB
+//   R=50 ->    125,000 stored,  12.8 MB
+//   R=80 ->    512,000 stored,  52.1 MB      (~104 bytes/statement)
+// Extrapolating the same shape: R=1000 -> 1e9 statements (~100 GB) and
+// R=9999 -> 1e12. So
+//   screen -c p 64 "FOR([FOR([FOR([PRINT(\"x\")], 9999)], 9999)], 9999)"
+// is a ~55-character command that passes the memory check and the 1-50
+// instruction check, then hangs or OOMs the emulator inside AddInstruction,
+// before the scheduler ever runs it.
+//
+// Run: --gtest_also_run_disabled_tests --gtest_filter='*UnrollGrowth*'
+TEST(ProcessForBodyFromUserProgram, DISABLED_ForUnrollGrowthIsUnbounded) {
+  for (int r : {10, 30, 50}) {
+    const std::string src = "FOR([FOR([FOR([PRINT(\"x\")], " +
+                            std::to_string(r) + ")], " + std::to_string(r) +
+                            ")], " + std::to_string(r) + ")";
+    prosched::Interpreter parser;
+    std::vector<prosched::Statement> program;
+    ASSERT_TRUE(parser.ParseUserProgram(src, program));
+    ASSERT_EQ(program.size(), 1u) << "this is ONE user instruction";
+
+    prosched::Process p("unroll", 1, 0);
+    for (auto &s : program)
+      p.AddInstruction(s);
+
+    std::cout << "  repeats=" << r << " userInstructions=1 storedInstructions="
+              << p.GetTotalInstructions() << "\n";
+    EXPECT_EQ(p.GetTotalInstructions(), r * r * r);
+  }
+}
+
+} // namespace ProcessForBodyFromUserProgram

@@ -1,6 +1,7 @@
 #include "scheduler/Scheduler.h"
 #include "Config.h"
 #include "Context.h"
+#include "memory/PagingManager.h"
 #include "scheduler/process/Process.h"
 #include <algorithm>
 #include <chrono>
@@ -1805,3 +1806,387 @@ TEST(SchedulerPidUniqueness, ConcurrentCreationNeverReusesAPid) {
 }
 
 } // namespace SchedulerPidUniqueness
+
+// ─── Concurrency probes (ThreadSanitizer) ────────────────────────────────────
+//
+// These reproduce the whole system under the MO2 demo-2 memory profile
+// (max-overall-mem 1024 / mem-per-frame 256 = 4 frames, 8 cores) — the shape
+// where frames are scarcer than running processes, so nearly every access
+// evicts a page belonging to a process that is executing right now.
+//
+// DISABLED_ on purpose: a data race is not deterministic, so these are
+// sanitizer probes rather than CI gates. They assert nothing about timing;
+// ThreadSanitizer is the oracle. Run them with:
+//
+//   g++ -std=c++17 -fsanitize=thread -g -O1 -I . -I src -I src/commands \
+//       -include stdexcept -include iostream <harness>.cpp \
+//       src/commands/Interpreter.cpp src/commands/Statement.cpp -o probe
+//   setarch $(uname -m) -R ./probe
+//
+// A TSan build via CMake does NOT work here: gtest_discover_tests runs the
+// freshly linked binary as a post-build step, which fails under TSan on WSL
+// (ASLR) and then deletes the executable. Build the probe standalone.
+//
+// A 400 ms run of this configuration produced 21 distinct TSan reports across
+// three root causes, all recorded in the QA notes:
+//   1. Interpreter::address_space_ mutated by an evicting worker
+//      (PageIn -> WritePageToBackingStore -> GetPageSnapshot/ClearPageRange)
+//      while the owning worker executes WRITE. ~15 of the 21 reports.
+//   2. Process::GetTimestamp/GetClockTime call std::localtime, which returns a
+//      pointer to a single shared static std::tm. Every worker calls it for
+//      every log line.
+//   3. Scheduler::generatingProcesses / running are plain bools written by the
+//      CLI thread and read by the scheduler thread.
+namespace SchedulerConcurrencyProbe {
+
+static AlgoContext makeDemoTwoCtx() {
+  ConfigStruct *cs = makeDefault();
+  cs->scheduler = "rr";
+  cs->num_cpu = 8;
+  cs->rr_quantum_cycles = 1;
+  cs->batch_process_freq = 1;
+  cs->min_ins = 20;
+  cs->max_ins = 40;
+  cs->delay_per_exec = 0;
+  cs->min_mem_per_proc = 256;
+  cs->max_mem_per_proc = 512;
+  cs->mem_per_frame = 256;
+  cs->max_overall_mem = 1024; // 4 frames for 8 cores
+  AlgoContext ctx = AlgoContext::buildConfig(cs);
+  delete cs;
+  return ctx;
+}
+
+TEST(SchedulerConcurrencyProbe, DISABLED_DemoLoadIsFreeOfDataRaces) {
+  AlgoContext ctx = makeDemoTwoCtx();
+  prosched::PagingManager pm(ctx.mem_per_frame, ctx.max_overall_mem);
+  prosched::Scheduler sched(ctx, &pm);
+
+  sched.Start();
+  sched.ResumeGenerating(); // plain-bool write from this thread
+
+  // The read-only commands a grader types during the demo, from another thread.
+  std::thread cli([&] {
+    for (int i = 0; i < 60; ++i) {
+      (void)sched.GetCpuUtilization();
+      (void)sched.GetCpuTickStats();
+      (void)pm.GetMemoryStats();
+      (void)pm.GetFrameSnapshot();
+      (void)sched.IsRunning();
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  cli.join();
+  sched.StopGenerating();
+  sched.Stop();
+
+  SUCCEED() << "ran to completion; ThreadSanitizer is the oracle for this test";
+}
+
+} // namespace SchedulerConcurrencyProbe
+
+// The instruction generator's RNG (Statement.cpp:38-42) is a function-local
+// static std::mt19937 carrying this documentation:
+//
+//     @warning not thread-safe; callers are serialized by the scheduler
+//
+// That claim is false. GetRandomStatement has two callers on two threads:
+//   - generateProcess (Scheduler.h:350) <- GenerateProcessesCycle <- SchedulerLoop
+//     ... the SCHEDULER thread, and
+//   - CreateNamedProcess (Scheduler.h:419) <- Controller::ExecuteCommand
+//     ... the CLI thread.
+// Neither holds a lock while generating: CreateNamedProcess releases
+// schedulerMutex after claiming a pid (Scheduler.h:408-411) and only then
+// builds min_ins..max_ins statements.
+//
+// So typing "screen -s <name> <size>" while the scheduler is generating races
+// the shared engine. TSan names it exactly:
+//   Location is global 'prosched::(anonymous namespace)::Rng()::gen' of size 5000
+//   Read  by the CLI thread in mersenne_twister_engine::operator()
+//   Write by the scheduler thread in mersenne_twister_engine::_M_gen_rand
+//
+// Same window as the known duplicate-PID race, so claiming the pid AND
+// generating under one lock hold fixes both at once.
+//
+// DISABLED_: TSan is the oracle. See the comment on
+// SchedulerConcurrencyProbe for the standalone build recipe.
+namespace SchedulerRngRaceProbe {
+
+TEST(SchedulerRngRaceProbe, DISABLED_ScreenDashSDuringGenerationDoesNotRaceTheRng) {
+  AlgoContext ctx = makeSmallCtx("rr", 2, 5);
+  ctx.batch_process_frequency = 1; // generate every tick
+  ctx.min_ins = 30;
+  ctx.max_ins = 60;
+
+  prosched::PagingManager pm(64, 1024);
+  prosched::Scheduler sched(ctx, &pm);
+  sched.Start();
+  sched.ResumeGenerating();
+
+  std::thread cli([&] {
+    for (int i = 0; i < 40; ++i) {
+      sched.AddProcess(sched.CreateNamedProcess("cli" + std::to_string(i), 256));
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  });
+
+  cli.join();
+  sched.StopGenerating();
+  sched.Stop();
+
+  SUCCEED() << "ran to completion; ThreadSanitizer is the oracle for this test";
+}
+
+} // namespace SchedulerRngRaceProbe
+
+// The display path reads LIVE process state with no synchronisation against
+// the worker threads that mutate it.
+//
+// "screen -r <proc>" then "process-smi" (Controller.cpp:430-437) reads, on the
+// CLI thread: GetTotalInstructions(), GetCurrentInstructionIndex(), and
+// GetLogs(). Meanwhile a worker runs Process::ExecuteInstructions, which does
+// logs.push_back(...) (Process.h:224) and advances currentInstructionIndex.
+//
+// GetLogs() (Process.h:327) returns std::vector<std::string> BY VALUE, so the
+// CLI thread COPY-CONSTRUCTS the vector while the worker is emplacing into it.
+// TSan pins exactly that:
+//   Write by worker : vector<string>::emplace_back <- Process::ExecuteInstructions
+//   Read  by CLI    : vector<string>::size <- vector<string>::vector(const&)
+//                     <- Process::GetLogs (Process.h:327)
+// If the worker's push_back reallocates and frees the old buffer partway
+// through that copy, the CLI thread walks freed memory.
+//
+// Scheduler::PrintProcesses ("screen -ls") is the same class: it takes
+// schedulerMutex, but the WORKERS NEVER TAKE schedulerMutex, so that lock
+// gives it no protection over process fields at all.
+//
+// This is the documented MO2 demo workflow, not an exotic input.
+// DISABLED_: TSan is the oracle; see SchedulerConcurrencyProbe for the recipe.
+namespace SchedulerDisplayRaceProbe {
+
+TEST(SchedulerDisplayRaceProbe, DISABLED_ScreenLsAndProcessSmiDoNotRaceExecution) {
+  AlgoContext ctx = makeSmallCtx("rr", 4, 5);
+  ctx.batch_process_frequency = 1;
+  ctx.min_ins = 200;
+  ctx.max_ins = 400;
+
+  prosched::PagingManager pm(64, 4096);
+  prosched::Scheduler sched(ctx, &pm);
+  sched.Start();
+  sched.ResumeGenerating();
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+  std::thread cli([&] {
+    for (int i = 0; i < 80; ++i) {
+      std::ostringstream sink;
+      sched.PrintProcesses(sink); // screen -ls
+
+      for (prosched::Process *p : sched.GetAllProcesses()) {
+        if (p == nullptr || p->IsFinished())
+          continue;
+        // screen -r <proc> -> process-smi
+        (void)p->GetTotalInstructions();
+        (void)p->GetCurrentInstructionIndex();
+        for (const auto &line : p->GetLogs())
+          (void)line.size();
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+
+  cli.join();
+  sched.StopGenerating();
+  sched.Stop();
+
+  SUCCEED() << "ran to completion; ThreadSanitizer is the oracle for this test";
+}
+
+} // namespace SchedulerDisplayRaceProbe
+
+// ─── End-to-end frame conservation ───────────────────────────────────────────
+//
+// The capstone cross-cutting property: after every process has run to
+// completion through the REAL threaded scheduler — with sleeps, RR preemption,
+// page faults and eviction all in play — physical memory must return to fully
+// free. Any frame still allocated means some lifecycle transition dropped a
+// page without releasing it.
+//
+// MO2: "Memory spaces are pre-allocated and free to use by any processes upon
+// startup", and variables/pages are held "until the process finishes".
+namespace SchedulerFrameConservation {
+
+// NOTE ON CONSTRUCTION: processes MUST come from CreateProcessWithInstructions
+// (or CreateNamedProcess), never from `new Process` + AddProcess. AddProcess
+// does NOT attach paging — each production creation path calls the private
+// attachPaging itself. A hand-built process added directly runs completely
+// UNPAGED, which makes any frame assertion vacuously true. The pagesPagedIn /
+// pagesPagedOut guards below exist to catch exactly that mistake.
+TEST(SchedulerFrameConservation, AllFramesReturnToFreeAfterEveryProcessFinishes) {
+  AlgoContext ctx = makeSmallCtx("rr", 4, 3);
+  // Far fewer frames than processes, so eviction is forced throughout.
+  // 8 frames: MUST be >= 2 x num_cpu or the run livelocks outright (see
+  // SchedulerFrameStarvation below). 6 processes x 2 pages = 12 > 8, so
+  // eviction is still forced and the vacuity guards below stay meaningful.
+  prosched::PagingManager pm(64, 512); // 8 frames
+  prosched::Scheduler sched(ctx, &pm);
+  sched.Start();
+
+  // Mixed workload: memory traffic, a sleep (descheduled while holding pages),
+  // and arithmetic that touches the symbol segment.
+  std::vector<prosched::Process *> procs;
+  for (int i = 0; i < 6; ++i) {
+    std::string src = "WRITE 0x40 " + std::to_string(i + 1) +
+                      "; DECLARE a 3";
+    if (i % 2 == 0)
+      src += "; SLEEP 1";
+    src += "; READ v 0x40; ADD a a 1";
+
+    std::vector<prosched::Statement> program;
+    prosched::Interpreter parser;
+    ASSERT_TRUE(parser.ParseUserProgram(src, program)) << src;
+
+    prosched::Process *p = sched.CreateProcessWithInstructions(
+        "fc" + std::to_string(i), 256, program);
+    ASSERT_NE(p, nullptr);
+    procs.push_back(p);
+    sched.AddProcess(p);
+  }
+
+  // Poll for completion rather than sleeping a fixed amount.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  bool allDone = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    allDone = true;
+    for (auto *p : procs) {
+      if (!p->IsFinished()) {
+        allDone = false;
+        break;
+      }
+    }
+    if (allDone)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(allDone) << "processes did not all finish within 10s";
+
+  // FreeFinishedProcesses runs once per scheduler tick, so it can lag the last
+  // IsFinished() by a tick or two; give it a bounded chance to catch up.
+  const auto freeDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (pm.GetMemoryStats().usedFrames != 0 &&
+         std::chrono::steady_clock::now() < freeDeadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  auto stats = pm.GetMemoryStats();
+  sched.Stop();
+
+  // Vacuity guards: prove paging actually happened before trusting the result.
+  ASSERT_GT(stats.pagesPagedIn, 0u)
+      << "no page was ever paged in - the processes ran unpaged, so the frame "
+         "assertions below would be meaningless";
+  ASSERT_GT(stats.pagesPagedOut, 0u)
+      << "no eviction occurred - frame reuse was never exercised";
+
+  EXPECT_EQ(stats.usedFrames, 0)
+      << stats.usedFrames << " of " << stats.totalFrames
+      << " frames were never released after all processes finished";
+  EXPECT_EQ(stats.freeMemoryBytes, stats.totalMemoryBytes)
+      << "free memory did not return to the full pool";
+  for (auto *p : procs) {
+    EXPECT_EQ(pm.GetResidentPageCount(p->GetPID()), 0)
+        << p->GetName() << " still holds resident pages after finishing";
+  }
+}
+
+} // namespace SchedulerFrameConservation
+
+
+// ─── Frame starvation livelock ───────────────────────────────────────────────
+//
+// A single READ needs TWO pages resident at once: its data page, and page 0 for
+// the symbol-table segment that SetVariable touches via CheckSymbolTableAccess.
+// Nothing PINS a page an in-flight instruction has already faulted in, so each
+// core independently holds a half-satisfied instruction and evicts the pages the
+// other cores just faulted in.
+//
+// The threshold is therefore not "frames < pages per instruction" but
+//     frames < pages_per_instruction x concurrent_cores
+// because every busy core is fighting for its own pair of pages.
+//
+// MEASURED with a 4-instruction program (WRITE/DECLARE/READ/ADD), 6 processes,
+// RR quantum 3, 6s budget:
+//     cores=1  frames=2  COMPLETE      cores=2  frames=2  HUNG
+//     cores=2  frames=4  COMPLETE      cores=4  frames=2  HUNG
+//     cores=4  frames=8  COMPLETE      cores=4  frames=4  HUNG
+//     cores=8  frames=16 COMPLETE      cores=8  frames=4  HUNG
+// Exactly frames >= 2 x cores. A healthy run pages in ~12-17 times; a hung run
+// pages in ~800-990 times and retires NOTHING.
+//
+// THIS CONFIGURATION IS THE PROFESSOR'S MO2 DEMO 2: max-overall-mem 1024 /
+// mem-per-frame 256 = 4 frames, with num-cpu 8. It makes ZERO forward progress
+// — which is a different and worse diagnosis than "slow because of backing-store
+// I/O". MO2 requires page-fault handling to repeat "until a valid page has been
+// returned, before an instruction is performed"; it does not license the system
+// to never perform the instruction at all.
+//
+// FIX: pin the pages an instruction has already faulted in until it retires, or
+// pre-page everything the instruction needs before running it.
+namespace SchedulerFrameStarvation {
+
+TEST(SchedulerFrameStarvation, DemoConfigMakesForwardProgress) {
+  AlgoContext ctx = makeSmallCtx("rr", 8, 1); // demo 2: 8 cores, quantum 1
+  prosched::PagingManager pm(256, 1024);      // demo 2: 4 frames
+  prosched::Scheduler sched(ctx, &pm);
+  sched.Start();
+
+  std::vector<prosched::Process *> procs;
+  for (int i = 0; i < 6; ++i) {
+    std::vector<prosched::Statement> program;
+    prosched::Interpreter parser;
+    ASSERT_TRUE(parser.ParseUserProgram(
+        "WRITE 0x40 7; DECLARE a 3; READ v 0x40; ADD a a 1", program));
+    prosched::Process *p = sched.CreateProcessWithInstructions(
+        "starve" + std::to_string(i), 512, program);
+    ASSERT_NE(p, nullptr);
+    procs.push_back(p);
+    sched.AddProcess(p);
+  }
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  bool allDone = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    allDone = true;
+    for (auto *p : procs) {
+      if (!p->IsFinished()) {
+        allDone = false;
+        break;
+      }
+    }
+    if (allDone)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  int unfinished = 0;
+  for (auto *p : procs)
+    if (!p->IsFinished())
+      ++unfinished;
+  auto stats = pm.GetMemoryStats();
+  sched.Stop();
+
+  EXPECT_TRUE(allDone)
+      << unfinished << " of " << procs.size()
+      << " processes never retired on the demo-2 config (" << stats.totalFrames
+      << " frames, " << ctx.num_cpu << " cores). Pages in: " << stats.pagesPagedIn
+      << ", out: " << stats.pagesPagedOut
+      << " - the cores are evicting each other's half-faulted instructions "
+         "forever instead of making progress.";
+}
+
+} // namespace SchedulerFrameStarvation

@@ -1108,3 +1108,146 @@ TEST(InterpreterGetRandomStatement, ArgShapeMatchesKeyword) {
 }
 
 } // namespace InterpreterGetRandomStatement
+
+// ─── screen -c program validation: FOR bodies ────────────────────────────────
+//
+// ParseUserProgram is the gate for "screen -c". Its documented contract
+// (Interpreter.h:93-96) is: "Unlike Parse, this rejects anything it cannot
+// understand rather than producing kUnknown nodes, so a bad program never
+// becomes a process."
+//
+// It validates keyword / arg-count / arity for each TOP-LEVEL statement, but
+// never descends into a FOR body (Interpreter.cpp:236-245 loops over the
+// top-level instructions only; ParseStatement fills stmt.nested via ParseBlock,
+// which is the permissive parser and happily emits kUnknown).
+//
+// This matters beyond parsing: Process::AddInstruction UNROLLS a FOR at add
+// time, appending its body `repeats` times, so whatever the body contains
+// becomes real executable instructions in the process.
+namespace InterpreterParseUserProgramForBody {
+
+// A FOR body containing an unrecognised instruction must invalidate the whole
+// program, exactly as it does at the top level (covered by the passing
+// InterpreterParseUserProgram.InvalidInstructionReturnsFalse).
+TEST(InterpreterParseUserProgramForBody, UnknownInstructionInsideForIsRejected) {
+  prosched::Interpreter interp;
+  std::vector<prosched::Statement> out;
+
+  EXPECT_FALSE(interp.ParseUserProgram("FOR([BOGUS(1)], 3)", out))
+      << "a FOR body containing an unrecognised instruction was accepted; "
+         "the nested statement is kUnknown and AddInstruction will unroll it "
+         "into the process as real instructions";
+}
+
+// Same gap, with a body whose instruction is known but malformed: SUBTRACT
+// takes 3 arguments, so this is rejected at the top level but not inside FOR.
+TEST(InterpreterParseUserProgramForBody, MalformedInstructionInsideForIsRejected) {
+  prosched::Interpreter interp;
+  std::vector<prosched::Statement> out;
+
+  ASSERT_FALSE(interp.ParseUserProgram("SUBTRACT(varA)", out))
+      << "precondition: this is rejected at the top level";
+  EXPECT_FALSE(interp.ParseUserProgram("FOR([SUBTRACT(varA)], 3)", out))
+      << "the same malformed instruction is accepted once it is inside a FOR "
+         "body, so the arity check does not apply to nested statements";
+}
+
+// MO1 (retained by MO2's "all implemented features from MO1"): "FOR loops can
+// nest up to 3 levels deep." The random generator enforces this via
+// kMaxNestingDepth in GetRandomStatement, and
+// InterpreterGetRandomStatement.NeverReturnsForAtMaxDepth covers that path.
+// The screen -c path has no such limit, so a user program can nest without
+// bound — and because AddInstruction unrolls multiplicatively, each extra
+// level multiplies the stored instruction count.
+TEST(InterpreterParseUserProgramForBody, ForNestedDeeperThanThreeLevelsIsRejected) {
+  prosched::Interpreter interp;
+  std::vector<prosched::Statement> out;
+
+  // 4 levels of nesting.
+  const std::string four_deep =
+      "FOR([FOR([FOR([FOR([PRINT(\"x\")], 2)], 2)], 2)], 2)";
+
+  EXPECT_FALSE(interp.ParseUserProgram(four_deep, out))
+      << "screen -c accepted a FOR nested 4 levels deep; the spec caps FOR "
+         "nesting at 3 levels and the generator already enforces that";
+}
+
+} // namespace InterpreterParseUserProgramForBody
+
+// ─── Generated memory-access addresses ───────────────────────────────────────
+//
+// MO2: "Read/write memory operations are now included in generating process
+// instructions", a uint16 "consumes 2 bytes of memory", and an address outside
+// the process's dedicated space is an access violation that shuts the process
+// down. So every address the generator emits must be inside [0, memEnd) AND
+// leave room for both bytes — otherwise ordinary generated processes would
+// terminate themselves at random, which no demo expects.
+namespace StatementGeneratedAddresses {
+
+// Collects every READ/WRITE address in a statement tree (FOR bodies included).
+static void CollectAddresses(const prosched::Statement &s,
+                             std::vector<std::string> *out) {
+  if (s.keyword == prosched::Keyword::kRead && s.args.size() >= 2) {
+    out->push_back(s.args[1]); // READ(var, address)
+  } else if (s.keyword == prosched::Keyword::kWrite && !s.args.empty()) {
+    out->push_back(s.args[0]); // WRITE(address, value)
+  }
+  for (const auto &nested : s.nested) {
+    CollectAddresses(nested, out);
+  }
+}
+
+TEST(StatementGeneratedAddresses, AreInBoundsAndTwoByteAligned) {
+  // The sizes production can actually produce: powers of 2 from the spec's
+  // 64-byte minimum upward (screen -s validates exactly this shape).
+  for (int memEnd : {64, 128, 256, 1024, 4096, 65536}) {
+    SCOPED_TRACE("process memory size = " + std::to_string(memEnd));
+    std::vector<std::string> addresses;
+    for (int i = 0; i < 400; ++i) {
+      prosched::Statement s = prosched::GetRandomStatement("p", 0, 0, memEnd);
+      CollectAddresses(s, &addresses);
+    }
+    ASSERT_FALSE(addresses.empty())
+        << "generator emitted no READ/WRITE in 400 draws";
+
+    for (const std::string &text : addresses) {
+      ASSERT_EQ(text.rfind("0x", 0), 0u)
+          << "address is not hexadecimal as MO2 requires: " << text;
+      const unsigned long addr = std::stoul(text, nullptr, 16);
+
+      EXPECT_EQ(addr % 2, 0u)
+          << text << " is not 2-byte aligned, so the uint16 straddles a "
+                     "boundary";
+      EXPECT_LT(addr, static_cast<unsigned long>(memEnd))
+          << text << " is outside [0, " << memEnd
+          << "); a generated process would shut itself down on an access "
+             "violation";
+      EXPECT_LE(addr + 2, static_cast<unsigned long>(memEnd))
+          << text << " leaves less than 2 bytes before the end of the "
+                     "process's memory";
+    }
+  }
+}
+
+// MO1 (retained by MO2): "FOR loops can nest up to 3 levels deep." Both
+// production call sites pass max_depth = 0, so this checks what the scheduler
+// actually generates rather than the helper in isolation.
+TEST(StatementGeneratedAddresses, GeneratedForNestingNeverExceedsThreeLevels) {
+  std::function<int(const prosched::Statement &)> forDepth =
+      [&](const prosched::Statement &s) {
+        int deepest = 0;
+        for (const auto &n : s.nested) {
+          deepest = std::max(deepest, forDepth(n));
+        }
+        return s.keyword == prosched::Keyword::kFor ? deepest + 1 : deepest;
+      };
+
+  int worst = 0;
+  for (int i = 0; i < 3000; ++i) {
+    worst = std::max(worst, forDepth(prosched::GetRandomStatement("p", 0, 0, 1024)));
+  }
+  EXPECT_LE(worst, 3) << "generator produced FOR nested " << worst
+                      << " levels deep; the spec caps it at 3";
+}
+
+} // namespace StatementGeneratedAddresses
