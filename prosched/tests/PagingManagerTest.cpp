@@ -141,17 +141,31 @@ TEST(PagingManagerBasic, FrameSnapshotShowsResidentOwnership) {
 // page-in. A value written before eviction must survive being paged out and back.
 namespace PagingManagerBackingStore {
 
-TEST(PagingManagerBackingStore, EvictedValueSurvivesRoundTrip) {
-  prosched::PagingManager pm(16, 16); // exactly ONE frame
-  prosched::Interpreter interp;
+// Installs a demand pager for pid 1 backed by `pm`.
+static void wirePager(prosched::Interpreter &interp, prosched::PagingManager &pm,
+                      uint32_t pageSize) {
   interp.SetMemoryBounds(0, 256);
   pm.RegisterProcessInterpreter(1, &interp);
-  interp.SetPageSize(16);
+  interp.SetPageSize(pageSize);
   interp.SetPageFaultHandler([&pm](int pageNum) {
     if (pm.IsPageResident(1, pageNum))
       return false;
     return pm.PageIn(1, pageNum);
   });
+}
+
+// Verifies the round trip through the backing store ONLY: write, evict,
+// fault back in, confirm the bytes returned.
+//
+// Deliberately checks the restored page via GetPageSnapshot rather than a
+// second ExecuteRead. READ also touches the symbol-table segment, which with a
+// single frame drags in the eviction fight covered by the next test — routing
+// the check through the interpreter's own view keeps this test about
+// serialization and nothing else.
+TEST(PagingManagerBackingStore, EvictedValueSurvivesRoundTrip) {
+  prosched::PagingManager pm(16, 16); // exactly ONE frame
+  prosched::Interpreter interp;
+  wirePager(interp, pm, 16);
 
   // Store 123 at address 0x32 (page 3). Two attempts: fault-in, then write.
   interp.ExecuteWrite(pmWrite("0x32", "123"));
@@ -161,10 +175,63 @@ TEST(PagingManagerBackingStore, EvictedValueSurvivesRoundTrip) {
   pm.PageIn(1, 0);
   ASSERT_FALSE(pm.IsPageResident(1, 3));
 
-  // Reading 0x32 faults it back in from the backing store, then returns 123.
+  // Touching 0x32 faults page 3 back in and restores it from the backing store.
   interp.ExecuteRead(pmRead("x", "0x32"));
-  auto result = interp.ExecuteRead(pmRead("x", "0x32"));
-  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(pm.IsPageResident(1, 3));
+
+  // Page 3 spans addresses 48..63; 0x32 == 50 must have come back as 123.
+  bool found = false;
+  for (const auto &entry : interp.GetPageSnapshot(48, 16)) {
+    if (entry.first == 0x32) {
+      found = true;
+      EXPECT_EQ(entry.second, 123) << "value corrupted by the round trip";
+    }
+  }
+  EXPECT_TRUE(found) << "address 0x32 did not come back from the backing store";
+}
+
+// One instruction can need TWO pages resident at the same time. Since commit
+// b0cf116 the symbol table is paged: SetVariable calls CheckSymbolTableAccess
+// (Interpreter.cpp:572-583), which faults the page holding symbol_table_start
+// (== 0, so page 0). A READ therefore touches its DATA page for the value and
+// then page 0 to store the variable.
+//
+// Nothing pins a page that the in-flight instruction already faulted in, so
+// when frames < pages-per-instruction the two evict each other forever:
+//
+//   attempt 1: data page faults in    -> evicts page 0
+//   attempt 2: data page hit, reads value, then symbol page faults in
+//              -> evicts the data page, instruction abandoned for retry
+//   attempt 3: data page faults in    -> evicts page 0 ... repeats forever
+//
+// FAILING: the READ never completes. This is the regression behind the
+// original EvictedValueSurvivesRoundTrip failure — the backing store itself is
+// fine, so do not go looking there.
+//
+// Demo-relevant: max-overall-mem 1024 / mem-per-frame 256 gives 4 frames shared
+// by 8 cores, so a process can lose both pages between attempts the same way.
+// Fixes: pin the pages an instruction has faulted in until it retires, or fault
+// in everything the instruction needs before executing it.
+TEST(PagingManagerBackingStore, TwoPageInstructionCompletesWithOneFrame) {
+  prosched::PagingManager pm(16, 16); // exactly ONE frame
+  prosched::Interpreter interp;
+  wirePager(interp, pm, 16);
+
+  interp.ExecuteWrite(pmWrite("0x32", "123"));
+  interp.ExecuteWrite(pmWrite("0x32", "123"));
+
+  // Retry the way Process::ExecuteInstructions does: a page fault does not
+  // advance the instruction, so the same READ is attempted again next tick.
+  std::optional<std::pair<std::string, uint16_t>> result;
+  int attempts = 0;
+  for (; attempts < 20 && !result.has_value(); ++attempts) {
+    result = interp.ExecuteRead(pmRead("x", "0x32"));
+  }
+
+  ASSERT_TRUE(result.has_value())
+      << "READ never completed in " << attempts
+      << " attempts: its data page and the symbol-table page keep evicting "
+         "each other, so the instruction can never retire";
   EXPECT_EQ(result->second, 123);
 }
 
