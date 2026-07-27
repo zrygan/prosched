@@ -45,8 +45,8 @@ AlgoContext Controller::initialize() {
     std::exit(1);
   }
 
-  if (this->ctx.rr_quantum_cycles <= 0) {
-    std::cerr << "Invalid config: Invalid quantum cycles number\n";
+  if (ctx.schedulerType == SchedulerType::RR && ctx.rr_quantum_cycles <= 0) {
+    std::cerr << "Invalid config: Invalid quantum cycles, must be >= 1\n";
     std::exit(1);
   }
 

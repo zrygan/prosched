@@ -44,10 +44,41 @@ public:
   Scheduler(AlgoContext ctx, PagingManager *pagingManager = nullptr)
       : ctx(ctx), pagingManager(pagingManager) {
 
-        if (ctx.min_ins > ctx.max_ins) {
+        if (this->ctx.num_cpu <= 0 || this->ctx.num_cpu >= 129) {
+          std::cerr << "Invalid config: num-cpu count invalid\n";
+          std::exit(1);
+        }
+
+        if (this->ctx.schedulerType == SchedulerType::UNKNOWN) {
+          std::cerr << "Invalid config: Unknown scheduler type\n";
+          std::exit(1);
+        }
+
+        if (ctx.schedulerType == SchedulerType::RR && ctx.rr_quantum_cycles <= 0) {
+          std::cerr << "Invalid config: Invalid quantum cycles, must be >= 1\n";
+          std::exit(1);
+        }
+
+        if (this->ctx.batch_process_frequency <= 0) {
+          std::cerr << "Invalid config: Invalid batch-process-frequency number\n";
+          std::exit(1);
+        }
+
+        if (this->ctx.min_ins > this->ctx.max_ins) {
           std::cerr << "Invalid config: min-ins must be lesser than max-ins\n";
           std::exit(1);
         }
+
+        if (this->ctx.min_ins < 1) {
+          std::cerr << "Invalid config: min-ins must be >= 1\n";
+          std::exit(1);
+        }
+
+        if (this->ctx.delay_per_execution < 0) {
+          std::cerr << "Invalid config: delay per execution cannot be below 0\n";
+          std::exit(1);
+        }
+
       }
 
   /**
