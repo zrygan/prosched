@@ -785,6 +785,38 @@ TEST(InterpreterSymbolSegmentPaging, DeclareFaultIsNotAnAccessViolation) {
       << "a symbol-segment page fault must not shut the process down";
 }
 
+// Reading a variable is a symbol-segment access too, not just writing one.
+// b0cf116 routed the paging check through SetVariable, so DECLARE/ADD/SUBTRACT
+// fault correctly on the WRITE. But ResolveOperand (Interpreter.cpp:509-511)
+// returns straight out of `memory_` when the name is found, without consulting
+// the pager at all — so a pure read of the symbol table never faults.
+//
+// PRINT of a bare variable isolates that path: it resolves an operand and
+// writes nothing, so the only symbol-table access it makes is a read.
+//
+// FAILING: the pager is never consulted, meaning a PRINT can read variables
+// out of a segment that is currently evicted to the backing store.
+TEST(InterpreterSymbolSegmentPaging, ReadingAVariableFaultsWhenSegmentNotResident) {
+  prosched::Interpreter interp;
+
+  // Declare varA while paging is off, so it genuinely exists in the table.
+  interp.ExecuteDeclare(makeStmt(prosched::Keyword::kDeclare, {"varA", "7"}));
+
+  // Now switch the pager on with nothing resident.
+  std::vector<int> consulted;
+  enablePaging(interp, &consulted);
+
+  interp.ExecutePrint(makeStmt(prosched::Keyword::kPrint, {"varA"}));
+
+  EXPECT_FALSE(consulted.empty())
+      << "PRINT read varA without consulting the pager: ResolveOperand hits "
+         "memory_ directly, so the symbol-table segment is read even when it "
+         "is not resident";
+  EXPECT_TRUE(interp.GetLastInstructionPageFault())
+      << "reading a variable touches the symbol-table segment, so it must "
+         "fault while that segment is non-resident";
+}
+
 } // namespace InterpreterSymbolSegmentPaging
 
 // ─── ParseUserProgram (screen -c, MO2) ──────────────────────────────────────
