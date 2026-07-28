@@ -275,6 +275,8 @@ bool Interpreter::ParseUserProgram(const std::string& program,
 void Interpreter::ExecuteStatements(const std::vector<Statement>& stmts) {
   ResetAccessState();
   for (const Statement& stmt : stmts) {
+    has_pending_read_value_ = false;
+    pending_read_variable_.clear();
     ExecuteStatement(stmt);
   }
 }
@@ -799,29 +801,43 @@ std::optional<std::pair<std::string, uint16_t>> Interpreter::ExecuteRead(
 
   const std::string variable_name = Trim(stmt.args[0]);
   const uint32_t address = ParseAddress(stmt.args[1]);
-  AccessStatus status = CheckAccess(address);
 
-  if (status == AccessStatus::kViolation) {
-    last_instruction_access_violation_ = true;
-    last_violation_address_ = address;
-    return std::nullopt;
+  if (!has_pending_read_value_) {
+    AccessStatus status = CheckAccess(address);
+    if (status == AccessStatus::kViolation) {
+        last_instruction_access_violation_ = true;
+        last_violation_address_ = address;
+        return std::nullopt;
+    }
+    if (status == AccessStatus::kFault) {
+        last_instruction_page_fault_ = true;
+        return std::nullopt;
+    }
+
+    uint16_t value = 0;
+    const auto it = address_space_.find(address);
+    if (it != address_space_.end()) value = it->second;
+
+    pending_read_value_ = value;
+    pending_read_variable_ = variable_name;
+    has_pending_read_value_ = true;
   }
 
-  if (status == AccessStatus::kFault) {
+  if (!CheckSymbolTableAccess()) {
     last_instruction_page_fault_ = true;
     return std::nullopt;
   }
 
-  uint16_t value = 0;
-  const auto it = address_space_.find(address);
-  if (it != address_space_.end()) {
-    value = it->second;
-  }
-
-  if (!SetVariable(variable_name, value)) {
+  if (!SetVariable(pending_read_variable_, pending_read_value_)) {
+    has_pending_read_value_ = false;
     return std::nullopt;
   }
-  return std::make_pair(variable_name, value);
+
+  uint16_t result = pending_read_value_;
+  has_pending_read_value_ = false;
+  pending_read_variable_.clear();
+
+  return std::make_pair(variable_name, result);
 }
 
 std::optional<std::pair<uint32_t, uint16_t>> Interpreter::ExecuteWrite(

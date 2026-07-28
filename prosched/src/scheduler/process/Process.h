@@ -116,6 +116,10 @@ public:
    */
   Statement *AddInstruction(Statement &stmt) {
     try {
+      if (stmt.keyword == Keyword::kUnknown) {
+        return nullptr;
+      }
+
       if (stmt.keyword == Keyword::kFor) {
         int repeats = 1;
         if (stmt.args.size() >= 2) {

@@ -571,8 +571,9 @@ public:
    * @param cpuCycles Current master clock tick cycle count.
    */
   void GenerateProcessesCycle(int cpuCycles) {
+    int pid = nextPID++;
     if (generatingProcesses && cpuCycles % ctx.batch_process_frequency == 0) {
-      Process *p = generateProcess(&this->ctx, nextPID, cpuCycles);
+      Process *p = generateProcess(&this->ctx, pid, cpuCycles);
       std::lock_guard<std::mutex> lock(schedulerMutex);
       processQueue.push(p);
       processes.push_back(p);

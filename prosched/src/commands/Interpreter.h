@@ -451,6 +451,10 @@ class Interpreter {
   uint32_t last_violation_address_ = 0;            /*!< Offending address */
 
   std::function<bool(int)> page_fault_handler_; /*!< Empty when unpaged */
+
+  uint16_t pending_read_value_ = 0;
+  bool has_pending_read_value_ = false;
+  std::string pending_read_variable_;
 };
 
 }  // namespace prosched
