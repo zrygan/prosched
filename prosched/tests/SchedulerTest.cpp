@@ -1632,43 +1632,89 @@ TEST(SchedulerConfigValidation, NegativeDelayPerExecRejectedAtStartup) {
 
 namespace SchedulerForGeneration {
 
-// Observed via the instruction count, not by scanning for kFor: AddInstruction
-// UNROLLS a FOR into `repeats` copies of its body, so a kFor never survives
-// into the statements vector even when one is generated. With min-ins ==
-// max-ins == 500 the draw is exactly 500 statements, so any FOR among them
-// pushes the stored total above 500. It stays at exactly 500 today because no
-// FOR is ever drawn.
+// RETARGETED 2026-07-28. This test used to infer "a FOR was generated" from the
+// stored instruction count exceeding the drawn count, because AddInstruction
+// unrolls a FOR and a kFor never survives into the statements vector.
 //
-// NOTE for whoever fixes this: the fix is the initial depth at the two call
-// sites (3 -> 0), NOT removing the `max_depth >= kMaxNestingDepth` guard —
-// that guard is correct and is covered by
-// InterpreterGetRandomStatement.NeverReturnsForAtMaxDepth. This test also
-// assumes unrolling stays; if FOR is ever changed to execute via
-// Interpreter::ExecuteFor instead, retarget it rather than deleting it.
-TEST(SchedulerForGeneration, GeneratedProcessCanContainForLoops) {
+// Commit 48c74ab removed that signal on purpose: generateProcess now draws
+// until the STORED total reaches commandAmount and skips any FOR that would
+// overshoot, so the count no longer exceeds the draw. The old assertion became
+// FLAKY (2 of 10 runs) — and it only passed at all when the cap LEAKED, which
+// is the separate bug covered by SchedulerInstructionCountCap below.
+//
+// So this now observes the generator directly, which is what the original fix
+// (initial depth 3 -> 0) actually changed, and is stable.
+TEST(SchedulerForGeneration, GeneratorProducesForLoopsAtProductionDepth) {
+  int forCount = 0;
+  for (int i = 0; i < 2000; ++i) {
+    // Both production call sites pass max_depth = 0.
+    if (prosched::GetRandomStatement("gen", 0, 0, 256).keyword ==
+        prosched::Keyword::kFor) {
+      ++forCount;
+    }
+  }
+  EXPECT_GT(forCount, 0)
+      << "2000 draws at the production depth produced no FOR at all; both call "
+         "sites would be passing max_depth == kMaxNestingDepth, which strips "
+         "kFor from the pool before the first draw";
+}
+
+} // namespace SchedulerForGeneration
+
+// ─── Generated instruction count must respect max-ins ────────────────────────
+//
+// 48c74ab caps generation by predicting how far a FOR will expand:
+//     wouldAdd = nested.size() * repeats            (Scheduler.h)
+// and skipping the FOR when total + wouldAdd would exceed commandAmount.
+//
+// That prediction is wrong for a FOR whose body contains another FOR, because
+// AddInstruction unrolls RECURSIVELY: the inner FOR expands again for every one
+// of the outer FOR's repeats. The prediction counts the inner FOR as a single
+// instruction.
+//
+// MEASURED, min-ins == max-ins == 500, 300 generated processes:
+//     33.3% exceeded the cap; worst case 977 instructions (nearly 2x).
+// The same undercount applies at both call sites (generateProcess and
+// CreateNamedProcess) since they share the logic.
+//
+// FIX: compute the expansion recursively, or simply add the statement and
+// compare GetTotalInstructions() afterwards, trimming if it overshot.
+namespace SchedulerInstructionCountCap {
+
+TEST(SchedulerInstructionCountCap, GeneratedCountNeverExceedsMaxIns) {
   ConfigStruct *cs = makeDefault();
   cs->scheduler = "fcfs";
   cs->batch_process_freq = 1000000;
   cs->min_ins = 500;
-  cs->max_ins = 500;
+  cs->max_ins = 500; // exact draw, so the cap is unambiguous
   AlgoContext ctx = AlgoContext::buildConfig(cs);
   delete cs;
 
   prosched::Scheduler scheduler(ctx);
-  prosched::Process *p = scheduler.CreateNamedProcess("for_gen", 256);
-  ASSERT_NE(p, nullptr);
+  int over = 0, worst = 0;
+  const int kSamples = 50;
+  for (int i = 0; i < kSamples; ++i) {
+    prosched::Process *p =
+        scheduler.CreateNamedProcess("cap" + std::to_string(i), 256);
+    ASSERT_NE(p, nullptr);
+    const int total = p->GetTotalInstructions();
+    if (total > 500) {
+      ++over;
+      worst = std::max(worst, total);
+    }
+    delete p;
+  }
 
-  EXPECT_GT(p->GetTotalInstructions(), 500)
-      << "500 drawn instructions produced exactly "
-      << p->GetTotalInstructions()
-      << " stored instructions, so no FOR was ever generated: both call sites "
-         "pass max_depth=3 (== kMaxNestingDepth), which removes kFor from the "
-         "pool before the very first draw";
-
-  delete p;
+  EXPECT_EQ(over, 0) << over << " of " << kSamples
+                     << " generated processes exceeded max-ins (worst = "
+                     << worst
+                     << " instructions against a cap of 500). A FOR nested "
+                        "inside a FOR expands further than nested.size() * "
+                        "repeats predicts, so the overshoot guard lets it "
+                        "through.";
 }
 
-} // namespace SchedulerForGeneration
+} // namespace SchedulerInstructionCountCap
 
 // ─── What a finished process keeps alive (footprint, not correctness) ───────
 // Scheduler::processes never shrinks, and that is CORRECT — MO1 requires

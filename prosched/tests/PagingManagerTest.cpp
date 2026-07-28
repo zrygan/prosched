@@ -797,3 +797,104 @@ TEST(PagingLifecycleSeams, TerminatedProcessReleasesItsFrames) {
 }
 
 } // namespace PagingLifecycleSeams
+
+// ─── Regressions from the page-pinning fix (78f3e68) ─────────────────────────
+//
+// Pinning correctly fixed the frame-starvation livelock: every frames x cores
+// combination now completes (verified independently, 16 configs, including the
+// demo-2 shape of 4 frames / 8 cores that previously retired nothing).
+//
+// These cover two holes the fix opened.
+namespace PagingManagerPinRegression {
+
+// HOLE 1: pinCount is never cleared when a frame is released or reused.
+// FreeAllPagesForProcess clears `allocated` but not `pinCount`, and PageIn sets
+// `allocated = true` without resetting `pinCount`. So a frame freed while still
+// pinned re-enters the free pool poisoned: the next page to occupy it is born
+// pinned and can never be evicted.
+//
+// This is REACHABLE, not theoretical. UnpinAllPagesForProcess has exactly one
+// caller (Process.h:234), on the path where an instruction RETIRES. The
+// access-violation path returns at Process.h:227, BEFORE that call — so every
+// process shut down by a memory access violation leaves its pages pinned, and
+// the scheduler then frees those frames back into the pool.
+TEST(PagingManagerPinRegression, FrameFreedWhilePinnedIsReusableAndEvictable) {
+  prosched::PagingManager pm(64, 64); // exactly ONE frame
+  prosched::Interpreter a, b;
+  a.SetMemoryBounds(0, 512);
+  b.SetMemoryBounds(0, 512);
+  pm.RegisterProcessInterpreter(1, &a);
+  pm.RegisterProcessInterpreter(2, &b);
+
+  // Process 1 faults a page in and pins it, exactly as the fault handler does.
+  ASSERT_TRUE(pm.PageIn(1, 0));
+  pm.PinPage(1, 0);
+
+  // Process 1 dies on an access violation, so it never unpins; the scheduler
+  // reclaims its frames via FreeFinishedProcesses -> FreeAllPagesForProcess.
+  pm.FreeAllPagesForProcess(1);
+  ASSERT_EQ(pm.GetMemoryStats().usedFrames, 0)
+      << "precondition: the frame returned to the free pool";
+
+  // Process 2 takes the recycled frame, then needs a second page.
+  ASSERT_TRUE(pm.PageIn(2, 0));
+  EXPECT_TRUE(pm.PageIn(2, 1))
+      << "the recycled frame still carries process 1's pin count, so it can "
+         "never be evicted again - each process killed by an access violation "
+         "permanently removes a frame from the replacement pool";
+}
+
+// HOLE 2: when PageIn cannot find an unpinned victim it returns false, and the
+// fault handler installed by Scheduler::attachPaging returns that value
+// straight through:
+//     if (IsPageResident(...)) return false;   // false == "no fault"
+//     return PageIn(...);                      // false == "no fault" TOO
+// CheckAccess reads false as "no fault, proceed", so the instruction executes
+// against a page that is NOT resident and whose contents were already cleared
+// by ClearPageRange when it was evicted.
+//
+// MEASURED: 999 written to 0x40, page evicted, all frames pinned, then READ
+// returns 0 with fault=0 and violation=0 - indistinguishable from MO2's
+// legitimate "uninitialised address reads 0". The instruction retires and the
+// index advances, so the value is lost silently.
+TEST(PagingManagerPinRegression, FailedPageInMustNotLookLikeASuccessfulAccess) {
+  prosched::PagingManager pm(64, 128); // 2 frames
+  prosched::Interpreter in;
+  in.SetMemoryBounds(0, 512);
+  in.SetPageSize(64);
+  pm.RegisterProcessInterpreter(1, &in);
+  in.SetPageFaultHandler([&pm](int pageNum) {
+    if (pm.IsPageResident(1, pageNum))
+      return false;
+    return pm.PageIn(1, pageNum);
+  });
+
+  for (int i = 0; i < 5; ++i) {
+    in.ExecuteWrite(pmWrite("0x40", "999"));
+    if (!in.GetLastInstructionPageFault())
+      break;
+  }
+  ASSERT_TRUE(pm.IsPageResident(1, 1)) << "precondition: 0x40 is page 1";
+
+  // Fill and pin every frame so page 1 is evicted and nothing can be replaced.
+  ASSERT_TRUE(pm.PageIn(1, 2));
+  ASSERT_TRUE(pm.PageIn(1, 3));
+  ASSERT_FALSE(pm.IsPageResident(1, 1))
+      << "precondition: page 1 was evicted to the backing store";
+  pm.PinPage(1, 2);
+  pm.PinPage(1, 3);
+
+  auto result = in.ExecuteRead(pmRead("v", "0x40"));
+
+  // Either outcome is acceptable: report a fault so the scheduler retries, or
+  // succeed with the real value. Returning 0 as a success is not.
+  if (!in.GetLastInstructionPageFault()) {
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->second, 999)
+        << "READ reported success (no fault, no violation) but the page was "
+           "not resident, so it returned 0 instead of the stored 999 - silent "
+           "data loss, indistinguishable from an uninitialised address";
+  }
+}
+
+} // namespace PagingManagerPinRegression
