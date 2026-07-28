@@ -204,6 +204,11 @@ public:
     interpreter.ResetLastInstructionAccessViolation();
     interpreter.ExecuteStatements({stmt});
 
+    if (interpreter.GetLastInstructionPageFault()) {
+      interpreter.FlushBuffer();
+      return statements;
+    }
+
     if (interpreter.GetLastInstructionAccessViolation()) {
       lastViolationTime = GetTimestamp();
       lastViolationClockTime = GetClockTime();
@@ -215,9 +220,7 @@ public:
       return statements;
     }
 
-    if (!interpreter.GetLastInstructionPageFault()) {
-      currentInstructionIndex++;
-    }
+    currentInstructionIndex++;
 
     auto output = interpreter.FlushBuffer();
     for (const auto &line : output) {

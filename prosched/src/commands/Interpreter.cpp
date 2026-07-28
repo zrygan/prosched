@@ -721,8 +721,14 @@ std::optional<uint16_t> Interpreter::ExecuteAdd(const Statement& stmt) {
     return std::nullopt;
   }
 
-  const uint16_t result = static_cast<uint16_t>(ResolveOperand(stmt.args[1]) +
-                                                ResolveOperand(stmt.args[2]));
+  const uint16_t op1 = ResolveOperand(stmt.args[1]);
+  const uint16_t op2 = ResolveOperand(stmt.args[2]);
+
+  if (last_instruction_page_fault_ || last_instruction_access_violation_) {
+    return std::nullopt;
+  }
+
+  const uint16_t result = static_cast<uint16_t>(op1 + op2);
   if (!SetVariable(stmt.args[0], result)) {
     return std::nullopt;
   }
@@ -734,8 +740,14 @@ std::optional<uint16_t> Interpreter::ExecuteSubtract(const Statement& stmt) {
     return std::nullopt;
   }
 
-  const uint16_t result = static_cast<uint16_t>(ResolveOperand(stmt.args[1]) -
-                                                ResolveOperand(stmt.args[2]));
+  const uint16_t op1 = ResolveOperand(stmt.args[1]);
+  const uint16_t op2 = ResolveOperand(stmt.args[2]);
+
+  if (last_instruction_page_fault_ || last_instruction_access_violation_) {
+    return std::nullopt;
+  }
+
+  const uint16_t result = static_cast<uint16_t>(op1 - op2);
   if (!SetVariable(stmt.args[0], result)) {
     return std::nullopt;
   }
@@ -829,6 +841,11 @@ std::optional<std::pair<uint32_t, uint16_t>> Interpreter::ExecuteWrite(
   }
 
   const uint16_t value = ResolveOperand(stmt.args[1]);
+
+  if (last_instruction_page_fault_ || last_instruction_access_violation_) {
+    return std::nullopt;
+  }
+  
   address_space_[address] = value;
   return std::make_pair(address, value);
 }
