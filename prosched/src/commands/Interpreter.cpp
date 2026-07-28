@@ -223,6 +223,26 @@ std::string Interpreter::CanonicalizeUserInstruction(
   return canonical + ")";
 }
 
+bool ValidateStatements(const std::vector<Statement>& stmts, int depth = 0) {
+  if (depth >= 3) {
+    for (const auto& stmt : stmts) {
+      if (stmt.keyword == Keyword::kFor) return false;
+    }
+  }
+  for (const auto& stmt : stmts) {
+    if (stmt.keyword == Keyword::kUnknown){
+      return false;
+    }
+    if (stmt.args.size() != ExpectedArgCount(stmt.keyword)){
+      return false;
+    } 
+    if (stmt.keyword == Keyword::kFor) {
+      if (!ValidateStatements(stmt.nested, depth + 1)) return false;
+    }
+  }
+  return true;
+}
+
 bool Interpreter::ParseUserProgram(const std::string& program,
                                    std::vector<Statement>& out) {
   const std::vector<std::string> instructions = SplitUserInstructions(program);
@@ -242,6 +262,10 @@ bool Interpreter::ParseUserProgram(const std::string& program,
       return false;
     }
     parsed.push_back(stmt);
+  }
+
+  if (!ValidateStatements(parsed, 0)) {
+    return false;
   }
 
   out = std::move(parsed);
@@ -452,6 +476,15 @@ std::vector<std::string> Interpreter::ExtractArgs(const std::string& stmt,
 std::vector<Statement> Interpreter::ParseBlock(const std::string& block_str) {
   std::vector<Statement> stmts;
   for (const std::string& instr : SplitInstructions(block_str)) {
+    const std::string canonical = CanonicalizeUserInstruction(instr);
+    Statement stmt = ParseStatement(canonical);
+
+    if (stmt.keyword == Keyword::kUnknown ||
+        stmt.args.size() != ExpectedArgCount(stmt.keyword) ||
+        !ArgListMatchesArity(canonical, stmt.keyword)) {
+      stmt.keyword = Keyword::kUnknown;
+    }
+
     stmts.push_back(ParseStatement(instr));
   }
   return stmts;
@@ -469,6 +502,13 @@ Statement Interpreter::ParseStatement(const std::string& stmt_str) {
   stmt.args = ExtractArgs(trimmed, stmt.keyword);
   if (stmt.keyword == Keyword::kFor && !stmt.args.empty()) {
     stmt.nested = ParseBlock(stmt.args[0]);
+
+    for (const auto& child : stmt.nested) {
+      if (child.keyword == Keyword::kUnknown) {
+        stmt.keyword = Keyword::kUnknown;
+        break;
+      }
+    }
   }
   return stmt;
 }
@@ -657,9 +697,19 @@ std::optional<uint16_t> Interpreter::ExecuteDeclare(const Statement& stmt) {
     return std::nullopt;
   }
 
-  const long value = std::stol(stmt.args[1]);
-  const uint16_t clamped = static_cast<uint16_t>(
-      std::clamp(value, 0L, static_cast<long>(UINT16_MAX)));
+  uint16_t clamped = 0;
+
+  try {
+    const long value = std::stol(stmt.args[1]);
+    clamped = static_cast<uint16_t>(
+        std::clamp(value, 0L, static_cast<long>(UINT16_MAX)));
+
+  } catch (const std::out_of_range&) {
+    clamped = UINT16_MAX;
+  } catch (const std::invalid_argument&) {
+    clamped = 0;
+  }
+
   if (!SetVariable(stmt.args[0], clamped)) {
     return std::nullopt;
   }
