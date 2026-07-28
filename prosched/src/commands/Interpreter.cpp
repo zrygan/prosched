@@ -551,6 +551,10 @@ uint16_t Interpreter::ResolveOperand(const std::string& op) {
     }
   }
 
+  if (!CheckSymbolTableAccess()) {
+    return 0; 
+  }
+
   const auto it = memory_.find(t);
   if (it != memory_.end()) {
     return it->second;

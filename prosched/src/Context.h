@@ -32,8 +32,10 @@ struct AlgoContext {
     } else if (sched == "rr") {
       ctx.schedulerType = SchedulerType::RR;
       ctx.rr_quantum_cycles = config->rr_quantum_cycles;
-    } else
+    } else {
       ctx.schedulerType = SchedulerType::UNKNOWN;
+      ctx.rr_quantum_cycles = -1;
+    }
 
     ctx.num_cpu = config->num_cpu;
     ctx.batch_process_frequency = config->batch_process_freq;
