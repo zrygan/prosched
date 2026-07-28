@@ -384,10 +384,29 @@ public:
     int commandAmount =
         this->ctx.min_ins + rand() % (ctx->max_ins - ctx->min_ins + 1);
 
-    for (int i = 0; i < commandAmount; i++) {
+    // for (int i = 0; i < commandAmount; i++) {
+    //   instruction = prosched::GetRandomStatement(name, 0, 0, static_cast<uint32_t>(rolledSize));
+    //   p->AddInstruction(instruction);
+    //   // std::cout << p->GetName() << " added an instruction\n";
+    // }
+
+    while (p->GetTotalInstructions() < commandAmount) {
       instruction = prosched::GetRandomStatement(name, 0, 0, static_cast<uint32_t>(rolledSize));
-      p->AddInstruction(instruction);
-      // std::cout << p->GetName() << " added an instruction\n";
+
+      int wouldAdd = 1;
+      if (instruction.keyword == Keyword::kFor) {
+        int repeats = 1;
+        if (instruction.args.size() >= 2) {
+          try { 
+            repeats = std::stoi(instruction.args[1]); 
+          } catch (...) {}
+        }
+        wouldAdd = (int)instruction.nested.size() * repeats;
+      }
+
+      if (p->GetTotalInstructions() + wouldAdd <= commandAmount) {
+        p->AddInstruction(instruction);
+      }
     }
 
     return p;
@@ -454,9 +473,28 @@ public:
     p->SetPagingManager(this->pagingManager);
     int commandAmount = this->ctx.min_ins +
                         rand() % (this->ctx.max_ins - this->ctx.min_ins + 1);
-    for (int i = 0; i < commandAmount; i++) {
+    // for (int i = 0; i < commandAmount; i++) {
+    //   Statement instruction = prosched::GetRandomStatement(name, 0, 0, static_cast<size_t>(memoryBytes));
+    //   p->AddInstruction(instruction);
+    // }
+
+    while (p->GetTotalInstructions() < commandAmount) {
       Statement instruction = prosched::GetRandomStatement(name, 0, 0, static_cast<size_t>(memoryBytes));
-      p->AddInstruction(instruction);
+
+      int wouldAdd = 1;
+      if (instruction.keyword == Keyword::kFor) {
+        int repeats = 1;
+        if (instruction.args.size() >= 2) {
+          try { 
+            repeats = std::stoi(instruction.args[1]); 
+          } catch (...) {}
+        }
+        wouldAdd = (int)instruction.nested.size() * repeats;
+      }
+
+      if (p->GetTotalInstructions() + wouldAdd <= commandAmount) {
+        p->AddInstruction(instruction);
+      }
     }
     return p;
   }
