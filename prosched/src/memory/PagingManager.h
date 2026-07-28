@@ -9,8 +9,10 @@
 #include <sstream>
 #include <utility>
 #include <vector>
+#include <iostream>
 
-#include "../scheduler/process/Process.h"
+// #include "../scheduler/process/Process.h"
+#include "../commands/Interpreter.h"
 
 namespace prosched {
 
@@ -20,6 +22,7 @@ public:
     int frameNumber = -1;
     std::size_t sizeBytes = 0;
     bool allocated = false;
+    int pinCount = 0;
   };
 
   struct PageTableEntry {
@@ -157,9 +160,13 @@ public:
       }
     }
 
-    while (!loadOrderQueue.empty()) {
+    size_t maxAttempts = loadOrderQueue.size();
+    size_t attempts = 0;
+
+    while (!loadOrderQueue.empty() && attempts < maxAttempts) {
       auto [victimPid, victimPageNum] = loadOrderQueue.front();
       loadOrderQueue.pop();
+      attempts++;
 
       auto victimPidIt = pageTables.find(victimPid);
       if (victimPidIt == pageTables.end()) {
@@ -172,13 +179,19 @@ public:
         continue;
       }
 
-      WritePageToBackingStore(victimPid, victimPageNum);
-      pagesPagedOut++;
-
       int victimFrame = victimPageIt->second.frameNumber;
-      if (victimFrame >= 0 && victimFrame < static_cast<int>(frames.size())) {
+      if (victimFrame >= 0 && victimFrame < (int)frames.size() &&
+          frames[victimFrame].pinCount > 0) {
+        loadOrderQueue.push({victimPid, victimPageNum});
+        continue;
+      }
+
+      if (victimFrame >= 0 && victimFrame < (int)frames.size()) {
         frames[victimFrame].allocated = false;
       }
+
+      WritePageToBackingStore(victimPid, victimPageNum);
+      pagesPagedOut++;
 
       victimPageIt->second.resident = false;
       victimPageIt->second.frameNumber = -1;
@@ -411,6 +424,60 @@ public:
   int GetTotalFrameCount() const {
     std::lock_guard<std::recursive_mutex> lock(pagingMutex);
     return totalFrames;
+  }
+
+  /**
+ * @brief Prevents a page from being evicted while in use
+ * Increments pin count for the frame holding the current page
+ */
+  void PinPage(int pid, int pageNum) {
+    std::lock_guard<std::recursive_mutex> lock(pagingMutex);
+    auto pidIt = pageTables.find(pid);
+    if (pidIt == pageTables.end()) return;
+
+    auto pageIt = pidIt->second.find(pageNum);
+    if (pageIt == pidIt->second.end() || !pageIt->second.resident) return;
+
+    int frameNum = pageIt->second.frameNumber;
+    if (frameNum >= 0 && frameNum < (int)frames.size()) {
+        frames[frameNum].pinCount++;
+    }
+  }
+
+  /**
+ * @brief Allows a page to be evicted again after use
+ * Decrements pin count for the frame holding the current page
+ */
+  void UnpinPage(int pid, int pageNum) {
+    std::lock_guard<std::recursive_mutex> lock(pagingMutex);
+    auto pidIt = pageTables.find(pid);
+    if (pidIt == pageTables.end()) return;
+
+    auto pageIt = pidIt->second.find(pageNum);
+    if (pageIt == pidIt->second.end() || !pageIt->second.resident) return;
+
+    int frameNum = pageIt->second.frameNumber;
+    if (frameNum >= 0 && frameNum < (int)frames.size()) {
+        if (frames[frameNum].pinCount > 0) {
+            frames[frameNum].pinCount--;
+        }
+    }
+  }
+
+  /**
+   * @brief
+   */
+  void UnpinAllPagesForProcess(int pid) {
+    std::lock_guard<std::recursive_mutex> lock(pagingMutex);
+    auto pidIt = pageTables.find(pid);
+    if (pidIt == pageTables.end()) return;
+
+    for (auto& [pageNum, entry] : pidIt->second) {
+      if (entry.resident && entry.frameNumber >= 0 &&
+        entry.frameNumber < (int)frames.size()) {
+        frames[entry.frameNumber].pinCount = 0;
+      }
+    }
   }
 
 private:

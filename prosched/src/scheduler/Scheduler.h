@@ -345,9 +345,15 @@ public:
     p->GetInterpreter().SetPageFaultHandler(
         [pagingMgr, pid = p->GetPID()](int pageNum) {
           if (pagingMgr->IsPageResident(pid, pageNum)) {
+            pagingMgr->PinPage(pid, pageNum);
             return false;
           }
-          return pagingMgr->PageIn(pid, pageNum);
+
+          bool brought_in = pagingMgr->PageIn(pid, pageNum);
+          if (brought_in) {
+            pagingMgr->PinPage(pid, pageNum);
+          }
+          return brought_in;
         });
   }
 
@@ -370,6 +376,7 @@ public:
     p->SetMemoryBounds(0, rolledSize);
     attachPaging(p);
     p->SetOwnedByScheduler(true);
+    p->SetPagingManager(this->pagingManager);
     Statement instruction;
 
     // std::cout << p->GetName() << "\n";
@@ -444,6 +451,7 @@ public:
     p->SetMemoryBounds(0, static_cast<size_t>(memoryBytes));
     attachPaging(p);
     p->SetOwnedByScheduler(true);
+    p->SetPagingManager(this->pagingManager);
     int commandAmount = this->ctx.min_ins +
                         rand() % (this->ctx.max_ins - this->ctx.min_ins + 1);
     for (int i = 0; i < commandAmount; i++) {
@@ -479,6 +487,7 @@ public:
     p->SetMemoryBounds(0, static_cast<size_t>(memoryBytes));
     attachPaging(p);
     p->SetOwnedByScheduler(true);
+    p->SetPagingManager(this->pagingManager);
     for (Statement instruction : instructions) {
       p->AddInstruction(instruction);
     }

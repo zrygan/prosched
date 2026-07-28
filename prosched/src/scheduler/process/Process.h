@@ -16,6 +16,7 @@
 
 #include "Config.h"
 #include "commands/Interpreter.h"
+#include "../../memory/PagingManager.h"
 
 namespace prosched {
 
@@ -46,6 +47,8 @@ private:
 
   size_t memStart = 0;
   size_t memEnd = 0;
+
+  PagingManager* pagingManager = nullptr;
 
   /**
    * @brief Generates a formatted time string representing the current system
@@ -220,7 +223,14 @@ public:
       return statements;
     }
 
-    currentInstructionIndex++;
+    if (!interpreter.GetLastInstructionPageFault() &&
+      !interpreter.GetLastInstructionAccessViolation()) {
+      currentInstructionIndex++;
+
+      if (pagingManager != nullptr) {
+          pagingManager->UnpinAllPagesForProcess(pid);
+      }
+    }
 
     auto output = interpreter.FlushBuffer();
     for (const auto &line : output) {
@@ -502,6 +512,13 @@ public:
    * @brief Checks if the last executed instruction of the process was a page fault
    */
   bool GetLastInstructionWasPageFault() const { return interpreter.GetLastInstructionPageFault(); }
+
+  /**
+   * @brief setting the paging manager used by the process
+   */
+  void SetPagingManager(PagingManager* pm) {
+    pagingManager = pm;
+  }
 
 };
 
