@@ -367,8 +367,13 @@ std::vector<std::string> Interpreter::ExtractArgs(const std::string& stmt,
       // right; kSleep bodies are numeric and cannot.
       const std::size_t end =
           (kw == Keyword::kPrint) ? stmt.find_last_of(')') : stmt.find(')');
+
       if (end != std::string::npos && end >= offset) {
-        args.push_back(Trim(stmt.substr(offset, end - offset)));
+        std::string arg = Trim(stmt.substr(offset, end - offset));
+        
+        if(!arg.empty()) {
+          args.push_back(arg);
+        }
       }
       break;
     }
