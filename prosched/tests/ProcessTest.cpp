@@ -994,40 +994,18 @@ TEST(ProcessFaultAtomicity, FaultingPrintIsNotLoggedTwice) {
 
 // ─── screen -c FOR body reaches the process ──────────────────────────────────
 //
-// Companion to InterpreterParseUserProgramForBody (InterpreterTest.cpp), which
-// shows ParseUserProgram does not validate FOR bodies. These confirm the
-// consequence rather than assuming it: AddInstruction unrolls the FOR at add
-// time, so whatever slipped through the gate becomes real instructions.
+// ParseUserProgram now validates FOR bodies: ValidateStatements
+// (Interpreter.cpp:226-243) recurses into stmt.nested for kFor, applying the
+// same keyword / arity checks as the top level. That closed the hole this
+// namespace was written for — an unrecognised or malformed nested instruction
+// no longer reaches AddInstruction, which would have unrolled it into real
+// executable instructions. The gate itself is covered by
+// InterpreterParseUserProgramForBody (InterpreterTest.cpp, 3 PASS); the
+// consequence test that lived here is gone with the bug.
+//
+// What is NOT fixed is below: the gate bounds nesting DEPTH but not the repeat
+// COUNT, so a program that passes every check still unrolls multiplicatively.
 namespace ProcessForBodyFromUserProgram {
-
-// The unrecognised nested instruction is not merely parsed — it is unrolled
-// into the process once per repeat and executed, logging a warning each time.
-TEST(ProcessForBodyFromUserProgram, UnknownInstructionInForBodyBecomesExecutable) {
-  prosched::Interpreter parser;
-  std::vector<prosched::Statement> program;
-  ASSERT_TRUE(parser.ParseUserProgram("FOR([BOGUS(1)], 3)", program))
-      << "precondition: the gate accepts this program (that is the bug under "
-         "test in InterpreterParseUserProgramForBody)";
-
-  prosched::Process p("bad_for_body", 1, 0);
-  for (auto &s : program)
-    p.AddInstruction(s);
-
-  EXPECT_EQ(p.GetTotalInstructions(), 0)
-      << "the unrecognised body was unrolled into "
-      << p.GetTotalInstructions()
-      << " executable instructions; a program that never should have become a "
-         "process now runs garbage";
-
-  for (int i = 0; i < 10 && !p.IsFinished(); ++i)
-    p.ExecuteInstructions(0);
-
-  for (const auto &line : p.GetLogs()) {
-    EXPECT_EQ(line.find("Unrecognized instruction"), std::string::npos)
-        << "process log contains an unrecognised-instruction warning, which "
-           "surfaces in screen -r: " << line;
-  }
-}
 
 // Measurement, not a gate: AddInstruction unrolls FOR multiplicatively, so a
 // single screen -c instruction expands to repeats^depth statements. This is at
