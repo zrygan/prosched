@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -58,6 +59,19 @@ class Interpreter {
       @param handler Callback taking a page number, returning true on fault
   */
   void SetPageFaultHandler(std::function<bool(int)> handler);
+
+  /** @brief Record whether one of this process's pages occupies a frame.
+
+      The pager pushes this in as it loads and evicts pages. A page-fault
+      handler that reports "no fault" has not necessarily made the page
+      resident (as it can run out of evictable frames) and the contents of an
+      evicted page are gone, so an access to one must fault regardless of what
+      the handler said.
+
+      @param page_number The page whose residency changed
+      @param resident True when the page has been loaded into a frame
+  */
+  void SetPageResidency(int page_number, bool resident);
 
   /** @brief Returns whether the most recently executed instruction hit a page
              fault. */
@@ -400,6 +414,13 @@ class Interpreter {
   /** @brief Clears the page-fault and access-violation state. */
   void ResetAccessState();
 
+  /** @brief Whether a page was paged out and has not been brought back.
+
+      @param page_number The page to check
+      @return true if the page's contents currently live in the backing store
+  */
+  bool IsPagedOut(int page_number) const;
+
   /** @brief Validates an access and records the resulting state.
 
       Bounds are checked before paging, so an out-of-bounds address never
@@ -451,6 +472,8 @@ class Interpreter {
   uint32_t last_violation_address_ = 0;            /*!< Offending address */
 
   std::function<bool(int)> page_fault_handler_; /*!< Empty when unpaged */
+  std::unordered_set<int> paged_out_pages_;     /*!< Pages held only by the
+                                                     backing store */
 
   uint16_t pending_read_value_ = 0;
   bool has_pending_read_value_ = false;

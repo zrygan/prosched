@@ -377,37 +377,11 @@ public:
     attachPaging(p);
     p->SetOwnedByScheduler(true);
     p->SetPagingManager(this->pagingManager);
-    Statement instruction;
-
-    // std::cout << p->GetName() << "\n";
 
     int commandAmount =
         this->ctx.min_ins + rand() % (ctx->max_ins - ctx->min_ins + 1);
 
-    // for (int i = 0; i < commandAmount; i++) {
-    //   instruction = prosched::GetRandomStatement(name, 0, 0, static_cast<uint32_t>(rolledSize));
-    //   p->AddInstruction(instruction);
-    //   // std::cout << p->GetName() << " added an instruction\n";
-    // }
-
-    while (p->GetTotalInstructions() < commandAmount) {
-      instruction = prosched::GetRandomStatement(name, 0, 0, static_cast<uint32_t>(rolledSize));
-
-      int wouldAdd = 1;
-      if (instruction.keyword == Keyword::kFor) {
-        int repeats = 1;
-        if (instruction.args.size() >= 2) {
-          try { 
-            repeats = std::stoi(instruction.args[1]); 
-          } catch (...) {}
-        }
-        wouldAdd = (int)instruction.nested.size() * repeats;
-      }
-
-      if (p->GetTotalInstructions() + wouldAdd <= commandAmount) {
-        p->AddInstruction(instruction);
-      }
-    }
+    fillWithRandomInstructions(p, rolledSize, commandAmount);
 
     return p;
   }
@@ -473,29 +447,8 @@ public:
     p->SetPagingManager(this->pagingManager);
     int commandAmount = this->ctx.min_ins +
                         rand() % (this->ctx.max_ins - this->ctx.min_ins + 1);
-    // for (int i = 0; i < commandAmount; i++) {
-    //   Statement instruction = prosched::GetRandomStatement(name, 0, 0, static_cast<size_t>(memoryBytes));
-    //   p->AddInstruction(instruction);
-    // }
 
-    while (p->GetTotalInstructions() < commandAmount) {
-      Statement instruction = prosched::GetRandomStatement(name, 0, 0, static_cast<size_t>(memoryBytes));
-
-      int wouldAdd = 1;
-      if (instruction.keyword == Keyword::kFor) {
-        int repeats = 1;
-        if (instruction.args.size() >= 2) {
-          try { 
-            repeats = std::stoi(instruction.args[1]); 
-          } catch (...) {}
-        }
-        wouldAdd = (int)instruction.nested.size() * repeats;
-      }
-
-      if (p->GetTotalInstructions() + wouldAdd <= commandAmount) {
-        p->AddInstruction(instruction);
-      }
-    }
+    fillWithRandomInstructions(p, static_cast<int>(memoryBytes), commandAmount);
     return p;
   }
 
@@ -754,6 +707,34 @@ private:
   std::uint64_t totalCpuTicks = 0;
   std::uint64_t activeCpuTicks = 0;
   std::uint64_t idleCpuTicks = 0;
+
+  /**
+   * @brief Gives a process a random program of exactly commandAmount
+   * instructions.
+   *
+   * max-ins is a hard cap, so a statement is only added once its full
+   * expansion is known to fit: a FOR is unrolled by AddInstruction, and a FOR
+   * nested inside it is unrolled again for every repeat of the outer loop.
+   * Statements that would overshoot are discarded and redrawn, which is why
+   * the loop is driven by the running total rather than a fixed trip count.
+   *
+   * @param p The process to fill
+   * @param memoryBytes The size of the process's address space, for READ/WRITE
+   * @param commandAmount The exact number of instructions to end up with
+   */
+  void fillWithRandomInstructions(Process *p, int memoryBytes,
+                                  int commandAmount) {
+    while (p->GetTotalInstructions() < commandAmount) {
+      Statement instruction =
+          prosched::GetRandomStatement(p->GetName(), 0, 0, memoryBytes);
+
+      const int wouldAdd = Process::CountExpandedInstructions(instruction);
+      if (wouldAdd > 0 &&
+          p->GetTotalInstructions() + wouldAdd <= commandAmount) {
+        p->AddInstruction(instruction);
+      }
+    }
+  }
 
   /**
    * @brief Frees memory allocated to finished processes.

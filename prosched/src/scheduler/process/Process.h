@@ -148,6 +148,45 @@ public:
   }
 
   /**
+   * @brief Counts the instructions AddInstruction would append for a statement.
+   *
+   * FOR statements are unrolled, and the unrolling is recursive: a FOR nested
+   * inside another FOR expands again on every repeat of the outer loop. A
+   * caller that has to respect an instruction budget must ask for this count
+   * rather than assume a statement costs one instruction.
+   *
+   * @param stmt The statement that would be added
+   * @return The number of statements it would expand into
+   */
+  static int CountExpandedInstructions(const Statement &stmt) {
+    if (stmt.keyword == Keyword::kUnknown) {
+      return 0;
+    }
+
+    if (stmt.keyword != Keyword::kFor) {
+      return 1;
+    }
+
+    int repeats = 1;
+    if (stmt.args.size() >= 2) {
+      try {
+        repeats = std::stoi(stmt.args[1]);
+      } catch (...) {
+        repeats = 1;
+      }
+    }
+    if (repeats <= 0) {
+      return 0;
+    }
+
+    int body = 0;
+    for (const Statement &nested : stmt.nested) {
+      body += CountExpandedInstructions(nested);
+    }
+    return body * repeats;
+  }
+
+  /**
    * @brief Executes the current instruction of the process on a CPU core.
    *
    * Executes one parsed Statement instruction. If it is the first statement,

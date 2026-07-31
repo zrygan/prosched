@@ -126,6 +126,18 @@ void Interpreter::SetPageFaultHandler(std::function<bool(int)> handler) {
   page_fault_handler_ = std::move(handler);
 }
 
+void Interpreter::SetPageResidency(int page_number, bool resident) {
+  if (resident) {
+    paged_out_pages_.erase(page_number);
+  } else {
+    paged_out_pages_.insert(page_number);
+  }
+}
+
+bool Interpreter::IsPagedOut(int page_number) const {
+  return paged_out_pages_.find(page_number) != paged_out_pages_.end();
+}
+
 bool Interpreter::GetLastInstructionPageFault() const {
   return last_instruction_page_fault_;
 }
@@ -612,8 +624,11 @@ Interpreter::AccessStatus Interpreter::CheckAccess(uint32_t address) {
     return AccessStatus::kOk;
   }
 
+  // A handler that reports no fault has not necessarily made the page resident; it may have found every frame pinned. 
+  // Proceeding then reads the zeroes left behind when the page was written out, 
+  // which is indistinguishable from an address that was never written.
   const int page_number = static_cast<int>(address / page_size_bytes_);
-  if (page_fault_handler_(page_number)) {
+  if (page_fault_handler_(page_number) || IsPagedOut(page_number)) {
     last_instruction_page_fault_ = true;
     return AccessStatus::kFault;
   }
@@ -626,7 +641,7 @@ bool Interpreter::CheckSymbolTableAccess() {
   }
 
   const int pageNumber = static_cast<int>(symbol_table_start/page_size_bytes_);
-  if (page_fault_handler_(pageNumber)) {
+  if (page_fault_handler_(pageNumber) || IsPagedOut(pageNumber)) {
       last_instruction_page_fault_ = true;
       return false;
   }

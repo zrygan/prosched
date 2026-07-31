@@ -145,19 +145,8 @@ public:
       }
     }
 
-    for (auto &frame : frames) {
-      if (!frame.allocated) {
-        frame.allocated = true;
-
-        auto &processPages = pageTables[pid];
-        processPages[pageNum] = PageTableEntry{true, frame.frameNumber};
-        if (HasPageInBackingStore(pid, pageNum)) {
-          ReadPageFromBackingStore(pid, pageNum);
-        }
-        loadOrderQueue.push({pid, pageNum});
-        pagesPagedIn++;
-        return true;
-      }
+    if (LoadIntoFreeFrame(pid, pageNum)) {
+      return true;
     }
 
     size_t maxAttempts = loadOrderQueue.size();
@@ -186,9 +175,7 @@ public:
         continue;
       }
 
-      if (victimFrame >= 0 && victimFrame < (int)frames.size()) {
-        frames[victimFrame].allocated = false;
-      }
+      ReleaseFrame(victimFrame);
 
       WritePageToBackingStore(victimPid, victimPageNum);
       pagesPagedOut++;
@@ -196,22 +183,16 @@ public:
       victimPageIt->second.resident = false;
       victimPageIt->second.frameNumber = -1;
 
-      for (auto &frame : frames) {
-        if (!frame.allocated) {
-          frame.allocated = true;
-
-          auto &processPages = pageTables[pid];
-          processPages[pageNum] = PageTableEntry{true, frame.frameNumber};
-          if (HasPageInBackingStore(pid, pageNum)) {
-            ReadPageFromBackingStore(pid, pageNum);
-          }
-          loadOrderQueue.push({pid, pageNum});
-          pagesPagedIn++;
-          return true;
-        }
+      if (LoadIntoFreeFrame(pid, pageNum)) {
+        return true;
       }
     }
 
+    // Every frame is pinned, so this page cannot be brought in. An instruction
+    // that holds pins and still needs a page it cannot get would sit on those
+    // frames forever while every other process waits for one: give the pins up
+    // so the frames can move, and let the instruction start over.
+    UnpinAllPagesForProcess(pid);
     return false;
   }
 
@@ -229,9 +210,8 @@ public:
     }
 
     for (auto &entry : pidIt->second) {
-      if (entry.second.resident && entry.second.frameNumber >= 0 &&
-          entry.second.frameNumber < static_cast<int>(frames.size())) {
-        frames[entry.second.frameNumber].allocated = false;
+      if (entry.second.resident) {
+        ReleaseFrame(entry.second.frameNumber);
       }
     }
 
@@ -272,6 +252,7 @@ public:
 
     interpreterIt->second->ClearPageRange(
         pageBase, static_cast<uint32_t>(memPerFrame));
+    interpreterIt->second->SetPageResidency(pageNum, false);
     PersistBackingStoreToFile();
   }
 
@@ -493,6 +474,69 @@ private:
   std::uint64_t pagesPagedOut = 0;
   mutable std::recursive_mutex pagingMutex;
   const std::string backingStoreFile = "csopesy-backing-store.txt";
+
+  /**
+   * @brief Loads a page into the first free frame, if there is one.
+   *
+   * The frame's pin count is reset as it is claimed: pins belong to the page
+   * that occupied the frame, never to the frame itself.
+   *
+   * @param pid The process ID.
+   * @param pageNum The page number.
+   * @return True if a free frame was found and the page loaded into it.
+   */
+  bool LoadIntoFreeFrame(int pid, int pageNum) {
+    for (Frame &frame : frames) {
+      if (frame.allocated) {
+        continue;
+      }
+
+      frame.allocated = true;
+      frame.pinCount = 0;
+
+      pageTables[pid][pageNum] = PageTableEntry{true, frame.frameNumber};
+      if (HasPageInBackingStore(pid, pageNum)) {
+        ReadPageFromBackingStore(pid, pageNum);
+      }
+      NotifyPageResidency(pid, pageNum, true);
+      loadOrderQueue.push({pid, pageNum});
+      pagesPagedIn++;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * @brief Returns a frame to the free pool, dropping any pin it carried.
+   *
+   * @param frameNumber The frame to release; out-of-range values are ignored.
+   */
+  void ReleaseFrame(int frameNumber) {
+    if (frameNumber < 0 || frameNumber >= static_cast<int>(frames.size())) {
+      return;
+    }
+
+    frames[frameNumber].allocated = false;
+    frames[frameNumber].pinCount = 0;
+  }
+
+  /**
+   * @brief Tells a process's interpreter that one of its pages moved.
+   *
+   * The interpreter refuses accesses to a page it knows is not in a frame, so
+   * a page-in that never happened cannot read back as an uninitialised zero.
+   *
+   * @param pid The process ID.
+   * @param pageNum The page number.
+   * @param resident True when the page now occupies a frame.
+   */
+  void NotifyPageResidency(int pid, int pageNum, bool resident) {
+    auto interpreterIt = processInterpreters.find(pid);
+    if (interpreterIt != processInterpreters.end() &&
+        interpreterIt->second != nullptr) {
+      interpreterIt->second->SetPageResidency(pageNum, resident);
+    }
+  }
 
   /**
    * @brief Checks if a page for a given process is present in the backing
