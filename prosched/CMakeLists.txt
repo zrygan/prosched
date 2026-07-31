@@ -59,6 +59,12 @@ add_executable(prosched_tests
 )
 target_include_directories(prosched_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(prosched_tests GTest::gtest_main)
+# Turns libstdc++ precondition violations (e.g. .front() on an empty string)
+# into an abort instead of silent UB, so tests can actually catch them.
+# The prosched exe itself is built with this too (see target_compile_options
+# above) - without it here, the test binary is LESS strict than the shipped
+# program and such bugs pass CI unnoticed.
+target_compile_definitions(prosched_tests PRIVATE _GLIBCXX_ASSERTIONS)
 
 include(GoogleTest)
 # WORKING_DIRECTORY set to source root so fromFile() can resolve "prosched/config.txt"
