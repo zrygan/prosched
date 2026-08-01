@@ -368,8 +368,11 @@ public:
    * @return Process generated
    */
   prosched::Process *generateProcess(AlgoContext *ctx, int pid, int tick) {
+    // Named after the pid it was actually given. Reading nextPID here instead
+    // would both race with the CLI thread and let a process be called
+    // "processN" while carrying a different pid.
     std::ostringstream oss;
-    oss << "process" << nextPID;
+    oss << "process" << pid;
     std::string name = oss.str();
     Process *p = new Process(name, pid, tick);
     int rolledSize =
@@ -561,19 +564,32 @@ public:
   /**
    * @brief Handles periodic batch process generation.
    *
+   * The pid is claimed under schedulerMutex, and only on a tick that actually
+   * generates. Claiming it before the check burned a pid on every idle tick,
+   * and claiming it outside the lock handed the same pid to a concurrent
+   * "screen -s": building the statements takes long enough for the CLI thread
+   * to claim and use it first. Two processes on one pid share a page table,
+   * an interpreter registration and backing-store entries in PagingManager.
+   *
    * @param cpuCycles Current master clock tick cycle count.
    */
   void GenerateProcessesCycle(int cpuCycles) {
-    int pid = nextPID++;
-    if (generatingProcesses && cpuCycles % ctx.batch_process_frequency == 0) {
-      Process *p = generateProcess(&this->ctx, pid, cpuCycles);
-      std::lock_guard<std::mutex> lock(schedulerMutex);
-      processQueue.push(p);
-      processes.push_back(p);
-      activeProcesses.push_back(p);
-
-      nextPID++;
+    if (!generatingProcesses || cpuCycles % ctx.batch_process_frequency != 0) {
+      return;
     }
+
+    int pid;
+    {
+      std::lock_guard<std::mutex> lock(schedulerMutex);
+      pid = nextPID++;
+    }
+
+    Process *p = generateProcess(&this->ctx, pid, cpuCycles);
+
+    std::lock_guard<std::mutex> lock(schedulerMutex);
+    processQueue.push(p);
+    processes.push_back(p);
+    activeProcesses.push_back(p);
   }
 
   /**

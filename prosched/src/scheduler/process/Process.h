@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -30,7 +31,19 @@ private:
   int coreNum = -1;
   int currentInstructionIndex = 0;
   int arrivalTick = 0;
-  ProcessState currentState = READY;
+  /**
+   * @brief The process's state, written by its worker and read by the CLI.
+   *
+   * A worker moves the process to RUNNING/WAITING/FINISHED/TERMINATED while
+   * the CLI thread reads it through GetState/IsFinished/IsTerminated for
+   * "screen -ls" and process-smi, so a plain enum member is a data race.
+   *
+   * Held by pointer for the same reason as logsMutex: an atomic cannot be
+   * copied or moved, and processes are also held by value in vectors.
+   */
+  std::shared_ptr<std::atomic<ProcessState>> currentState =
+      std::make_shared<std::atomic<ProcessState>>(READY);
+
   std::vector<std::string> logs;
 
   /**
@@ -265,13 +278,13 @@ public:
       return {};
     }
 
-    currentState = RUNNING;
+    currentState->store(RUNNING);
 
     if (StartTime.empty())
       StartTime = GetTimestamp();
 
     if (currentInstructionIndex >= (int)statements.size()) {
-      currentState = FINISHED;
+      currentState->store(FINISHED);
       if (finishTime.empty())
         finishTime = GetTimestamp();
       ReleaseInstructions();
@@ -280,7 +293,7 @@ public:
 
     const Statement &stmt = statements[currentInstructionIndex];
     if (stmt.keyword == Keyword::kSleep) {
-      currentState = WAITING;
+      currentState->store(WAITING);
       if (!stmt.args.empty()) {
         try {
           cyclesRemainingForSleep = std::stoi(stmt.args[0]);
@@ -299,7 +312,7 @@ public:
 
       if (currentInstructionIndex >= (int)statements.size() &&
           cyclesRemainingForSleep == 0) {
-        currentState = FINISHED;
+        currentState->store(FINISHED);
         if (finishTime.empty())
           finishTime = GetTimestamp();
         ReleaseInstructions();
@@ -326,7 +339,7 @@ public:
       lastViolationTime = GetTimestamp();
       lastViolationClockTime = GetClockTime();
       lastViolationAddress = interpreter.GetLastViolationAddress();
-      currentState = TERMINATED;
+      currentState->store(TERMINATED);
       if (finishTime.empty()) {
         finishTime = lastViolationTime;
       }
@@ -350,7 +363,7 @@ public:
     }
 
     if (currentInstructionIndex >= (int)statements.size()) {
-      currentState = FINISHED;
+      currentState->store(FINISHED);
       if (finishTime.empty())
         finishTime = GetTimestamp();
       ReleaseInstructions();
@@ -411,11 +424,12 @@ public:
    * @return true if the process is finished; otherwise false.
    */
   bool IsFinished() {
-    return currentState == FINISHED || currentState == TERMINATED;
+    const ProcessState state = currentState->load();
+    return state == FINISHED || state == TERMINATED;
   }
 
   /** @brief Checks if the process terminated because of an access violation. */
-  bool IsTerminated() const { return currentState == TERMINATED; }
+  bool IsTerminated() const { return currentState->load() == TERMINATED; }
 
   /**
    * @brief Gets the Process ID
@@ -526,7 +540,7 @@ public:
    *
    * @return the current ProcessState
    */
-  ProcessState GetState() const { return currentState; }
+  ProcessState GetState() const { return currentState->load(); }
 
   /**
    * @brief Sets the current state of the process
@@ -534,7 +548,7 @@ public:
    * @param state the ProcessState to set
    */
   void SetState(ProcessState state) {
-    currentState = state;
+    currentState->store(state);
     if (state == FINISHED || state == TERMINATED) {
       ReleaseInstructions();
     }
