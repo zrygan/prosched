@@ -2518,3 +2518,5 @@ TEST(SchedulerPidAllocation, PidsAreNotConsumedWhileIdle) {
          "which come from the same counter - bear no relation to the number of "
          "processes that exist.";
 }
+
+} // namespace SchedulerPidAllocation
