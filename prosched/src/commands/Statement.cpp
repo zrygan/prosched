@@ -29,15 +29,17 @@ constexpr int kMaxNestingDepth = 3;
 /** @brief Number of distinct variable names the generator draws from. */
 constexpr int kVariableNameCount = 10;
 
-/** @brief The generator's shared random source.
+/** @brief The generator's random source.
 
-    @return A process-wide Mersenne Twister, seeded once on first use
+    One generator per thread: a std::mt19937 carries mutable state, and both
+    the scheduler's generator thread and the CLI thread ("screen -s") reach the
+    statement generator, so a single shared instance would be advanced by two
+    threads at once.
 
-    @warning not thread-safe; callers are serialized by the scheduler
+    @return This thread's Mersenne Twister, seeded on first use
 */
 std::mt19937& Rng() {
-  static std::random_device rd;
-  static std::mt19937 gen(rd());
+  static thread_local std::mt19937 gen(std::random_device{}());
   return gen;
 }
 

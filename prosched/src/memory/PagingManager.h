@@ -83,6 +83,25 @@ public:
       frames[i].allocated = false;
     }
   }
+
+  /**
+   * @brief Destroys the manager, leaving the backing store file on disk
+   * current.
+   */
+  ~PagingManager() { FlushBackingStore(); }
+
+  /**
+   * @brief Brings the backing store file up to date with the in-memory store.
+   *
+   * Page-outs and page-ins only mark the store dirty, so anything that lets
+   * the file be read - the memory commands, releasing a process, shutdown -
+   * calls this first.
+   */
+  void FlushBackingStore() const {
+    std::lock_guard<std::recursive_mutex> lock(pagingMutex);
+    FlushBackingStoreIfDirty();
+  }
+
   /**
    * @brief Checks if a page is currently resident in physical memory.
    *
@@ -253,7 +272,7 @@ public:
     interpreterIt->second->ClearPageRange(
         pageBase, static_cast<uint32_t>(memPerFrame));
     interpreterIt->second->SetPageResidency(pageNum, false);
-    PersistBackingStoreToFile();
+    backingStoreDirty = true;
   }
 
   /**
@@ -275,7 +294,7 @@ public:
     if (interpreterIt == processInterpreters.end() ||
         interpreterIt->second == nullptr) {
       backingStore.erase(storeIt);
-      PersistBackingStoreToFile();
+      backingStoreDirty = true;
       return false;
     }
 
@@ -288,7 +307,7 @@ public:
     interpreterIt->second->RestorePageSnapshot(restoredValues);
 
     backingStore.erase(storeIt);
-    PersistBackingStoreToFile();
+    backingStoreDirty = true;
     return true;
   }
 
@@ -476,6 +495,17 @@ private:
   const std::string backingStoreFile = "csopesy-backing-store.txt";
 
   /**
+   * @brief Whether the in-memory store has changed since it was last written.
+   *
+   * Every page-out and page-in used to rewrite the whole file, which put a
+   * synchronous disk write on the page-fault path. The map is the source of
+   * truth instead, and the file is brought up to date whenever it can actually
+   * be looked at: when a process releases its memory and when the memory
+   * commands report.
+   */
+  mutable bool backingStoreDirty = false;
+
+  /**
    * @brief Loads a page into the first free frame, if there is one.
    *
    * The frame's pin count is reset as it is claimed: pins belong to the page
@@ -550,6 +580,17 @@ private:
     return backingStore.find({pid, pageNum}) != backingStore.end();
   }
   /**
+   * @brief Writes the backing store out if it changed since the last write.
+   */
+  void FlushBackingStoreIfDirty() const {
+    if (!backingStoreDirty) {
+      return;
+    }
+    PersistBackingStoreToFile();
+    backingStoreDirty = false;
+  }
+
+  /**
    * @brief Persists the current backing store state to a file.
    */
   void PersistBackingStoreToFile() const {
@@ -609,12 +650,13 @@ private:
     for (auto it = backingStore.begin(); it != backingStore.end();) {
       if (it->first.first == pid) {
         it = backingStore.erase(it);
+        backingStoreDirty = true;
       } else {
         ++it;
       }
     }
 
-    PersistBackingStoreToFile();
+    FlushBackingStoreIfDirty();
   }
 };
 

@@ -541,6 +541,10 @@ void PrintVmStatRow(std::ostream &out, std::uint64_t value,
 } // namespace
 
 void Controller::PrintVmStat() {
+  // The store is kept in memory while the scheduler runs; make the file match
+  // what is about to be reported.
+  this->pagingManager->FlushBackingStore();
+
   const prosched::PagingManager::MemoryStats memory =
       this->pagingManager->GetMemoryStats();
   const prosched::Scheduler::CpuTickStats ticks =
@@ -560,6 +564,8 @@ void Controller::PrintVmStat() {
 }
 
 void Controller::PrintProcessSmi() {
+  this->pagingManager->FlushBackingStore();
+
   const prosched::PagingManager::MemoryStats memory =
       this->pagingManager->GetMemoryStats();
 

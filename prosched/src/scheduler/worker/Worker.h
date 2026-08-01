@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -20,7 +21,11 @@ private:
   prosched::Process *currentProcess = nullptr;
   std::thread workerThread;
   mutable std::mutex workerMutex;
-  bool running = false;
+
+  // The scheduler thread clears this in Stop() while this worker's own thread
+  // is reading it at the top of its loop, outside workerMutex.
+  std::atomic<bool> running{false};
+
   prosched::Process *preemptedProcess = nullptr;
 
   int lastProcessedTick = 0;

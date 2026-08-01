@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -474,6 +476,23 @@ class Interpreter {
   std::function<bool(int)> page_fault_handler_; /*!< Empty when unpaged */
   std::unordered_set<int> paged_out_pages_;     /*!< Pages held only by the
                                                      backing store */
+
+  /** @brief Guards the state the pager reaches into from another thread.
+
+      Eviction runs on the FAULTING process's worker thread and snapshots,
+      clears and restores pages belonging to a victim process that is
+      executing concurrently, so address_space_ and paged_out_pages_ are
+      touched by two threads at once.
+
+      LOCK ORDER: this is the inner lock. The owning thread must never hold it
+      while calling the page-fault handler, because the pager takes its own
+      lock first and only then reaches back in here.
+
+      Held by pointer so that an Interpreter, and therefore a Process, stays
+      copyable: processes are also held by value in vectors.
+  */
+  mutable std::shared_ptr<std::mutex> paged_state_mutex_ =
+      std::make_shared<std::mutex>();
 
   uint16_t pending_read_value_ = 0;
   bool has_pending_read_value_ = false;

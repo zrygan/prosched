@@ -127,6 +127,7 @@ void Interpreter::SetPageFaultHandler(std::function<bool(int)> handler) {
 }
 
 void Interpreter::SetPageResidency(int page_number, bool resident) {
+  const std::lock_guard<std::mutex> guard(*paged_state_mutex_);
   if (resident) {
     paged_out_pages_.erase(page_number);
   } else {
@@ -135,6 +136,7 @@ void Interpreter::SetPageResidency(int page_number, bool resident) {
 }
 
 bool Interpreter::IsPagedOut(int page_number) const {
+  const std::lock_guard<std::mutex> guard(*paged_state_mutex_);
   return paged_out_pages_.find(page_number) != paged_out_pages_.end();
 }
 
@@ -315,6 +317,7 @@ std::vector<std::string> Interpreter::FlushBuffer() {
 
 std::vector<std::pair<uint32_t, uint16_t>> Interpreter::GetPageSnapshot(
     uint32_t start_address, uint32_t page_size) const {
+  const std::lock_guard<std::mutex> guard(*paged_state_mutex_);
   std::vector<std::pair<uint32_t, uint16_t>> snapshot;
   for (const auto& entry : address_space_) {
     if (entry.first >= start_address &&
@@ -326,6 +329,7 @@ std::vector<std::pair<uint32_t, uint16_t>> Interpreter::GetPageSnapshot(
 }
 
 void Interpreter::ClearPageRange(uint32_t start_address, uint32_t page_size) {
+  const std::lock_guard<std::mutex> guard(*paged_state_mutex_);
   std::vector<uint32_t> to_erase;
   for (const auto& entry : address_space_) {
     if (entry.first >= start_address &&
@@ -340,6 +344,7 @@ void Interpreter::ClearPageRange(uint32_t start_address, uint32_t page_size) {
 
 void Interpreter::RestorePageSnapshot(
     const std::vector<std::pair<uint32_t, uint16_t>>& page_entries) {
+  const std::lock_guard<std::mutex> guard(*paged_state_mutex_);
   for (const auto& entry : page_entries) {
     address_space_[entry.first] = entry.second;
   }
@@ -691,6 +696,16 @@ void Interpreter::ExecuteStatement(const Statement& stmt) {
   }
 }
 
+namespace {
+
+// A PRINT argument can be empty on both sides of the concat ("PRINT(+x)"),
+// so the quotes have to be checked without indexing into the string.
+bool IsQuoted(const std::string& text) {
+  return text.size() >= 2 && text.front() == '"' && text.back() == '"';
+}
+
+}  // namespace
+
 std::string Interpreter::ExecutePrint(const Statement& stmt) {
   const std::string arg = stmt.args[0];
   std::string output;
@@ -699,11 +714,11 @@ std::string Interpreter::ExecutePrint(const Statement& stmt) {
   if (plus_idx != std::string::npos) {
     const std::string str_part = Trim(arg.substr(0, plus_idx));
     const std::string var_part = Trim(arg.substr(plus_idx + 1));
-    if (str_part.front() == '"' && str_part.back() == '"') {
+    if (IsQuoted(str_part)) {
       output += str_part.substr(1, str_part.size() - 2);
     }
     output += std::to_string(ResolveOperand(var_part));
-  } else if (arg.front() == '"' && arg.back() == '"') {
+  } else if (IsQuoted(arg)) {
     output = arg.substr(1, arg.size() - 2);
   } else {
     output = std::to_string(ResolveOperand(arg));
@@ -830,8 +845,11 @@ std::optional<std::pair<std::string, uint16_t>> Interpreter::ExecuteRead(
     }
 
     uint16_t value = 0;
-    const auto it = address_space_.find(address);
-    if (it != address_space_.end()) value = it->second;
+    {
+      const std::lock_guard<std::mutex> guard(*paged_state_mutex_);
+      const auto it = address_space_.find(address);
+      if (it != address_space_.end()) value = it->second;
+    }
 
     pending_read_value_ = value;
     pending_read_variable_ = variable_name;
@@ -881,7 +899,10 @@ std::optional<std::pair<uint32_t, uint16_t>> Interpreter::ExecuteWrite(
     return std::nullopt;
   }
   
-  address_space_[address] = value;
+  {
+    const std::lock_guard<std::mutex> guard(*paged_state_mutex_);
+    address_space_[address] = value;
+  }
   return std::make_pair(address, value);
 }
 

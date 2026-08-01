@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <sstream>
@@ -31,6 +32,16 @@ private:
   int arrivalTick = 0;
   ProcessState currentState = READY;
   std::vector<std::string> logs;
+
+  /**
+   * @brief Held for every read of and append to logs.
+   *
+   * A worker appends to the log while the CLI thread copies it for
+   * "screen -r"/process-smi. It lives on the heap so that Process stays
+   * copyable, since processes are also held by value in vectors.
+   */
+  std::shared_ptr<std::mutex> logsMutex = std::make_shared<std::mutex>();
+
   bool ownedByScheduler = false;
   std::string StartTime;
   std::string lastViolationTime;
@@ -44,6 +55,15 @@ private:
 
   prosched::Interpreter interpreter;
   std::vector<prosched::Statement> statements;
+
+  /**
+   * @brief Instructions this process was created with.
+   *
+   * Counted separately from statements because the statements are released
+   * once the process can no longer run, while the count is still reported by
+   * "screen -ls" and report-util for the rest of the session.
+   */
+  int totalInstructions = 0;
 
   size_t memStart = 0;
   size_t memEnd = 0;
@@ -63,9 +83,9 @@ private:
   std::string GetTimestamp() {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm *tm = std::localtime(&t);
+    std::tm local = LocalTime(t);
     std::ostringstream oss;
-    oss << std::put_time(tm, "(%m/%d/%Y %I:%M:%S%p)");
+    oss << std::put_time(&local, "(%m/%d/%Y %I:%M:%S%p)");
     return oss.str();
   }
 
@@ -80,10 +100,51 @@ private:
   std::string GetClockTime() {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm *tm = std::localtime(&t);
+    std::tm local = LocalTime(t);
     std::ostringstream oss;
-    oss << std::put_time(tm, "%H:%M:%S");
+    oss << std::put_time(&local, "%H:%M:%S");
     return oss.str();
+  }
+
+  /**
+   * @brief Converts a time_t to local calendar time without sharing state.
+   *
+   * std::localtime returns a pointer to a single shared std::tm, so every
+   * worker that timestamps a log entry would be overwriting the struct the
+   * others are still formatting.
+   *
+   * @param t The time to convert
+   * @return The broken-down local time, owned by the caller
+   */
+  static std::tm LocalTime(std::time_t t) {
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &t);
+#else
+    localtime_r(&t, &local);
+#endif
+    return local;
+  }
+
+  /**
+   * @brief Appends a log entry, serialised against readers of the log.
+   */
+  void AppendLog(std::string entry) {
+    const std::lock_guard<std::mutex> guard(*logsMutex);
+    logs.push_back(std::move(entry));
+  }
+
+  /**
+   * @brief Releases the statements of a process that can no longer run.
+   *
+   * Finished and terminated processes are kept for the rest of the session so
+   * that "screen -ls" and report-util can still list them, but only their
+   * counters are read from then on. Holding on to the statement vector costs
+   * roughly 130 KB per process at the demo's max-ins.
+   */
+  void ReleaseInstructions() {
+    statements.clear();
+    statements.shrink_to_fit();
   }
 
 public:
@@ -140,6 +201,7 @@ public:
       }
 
       statements.push_back(stmt);
+      totalInstructions++;
       return &statements.back();
     } catch (const std::bad_alloc &e) {
       std::cerr << "Allocation failed: " << e.what();
@@ -197,18 +259,22 @@ public:
    * @return A vector containing all statements of the process.
    */
   std::vector<prosched::Statement> ExecuteInstructions(int coreNum) {
+    // A process that is already done keeps its state: its statements are gone,
+    // so running it again would only mislabel a terminated process as finished.
+    if (IsFinished()) {
+      return {};
+    }
+
     currentState = RUNNING;
 
     if (StartTime.empty())
       StartTime = GetTimestamp();
 
-    // std::cerr << "[DEBUG] " << processName << " idx=" <<
-    // currentInstructionIndex << " size=" << statements.size() << "\n";
-
     if (currentInstructionIndex >= (int)statements.size()) {
       currentState = FINISHED;
       if (finishTime.empty())
         finishTime = GetTimestamp();
+      ReleaseInstructions();
       return {};
     }
 
@@ -228,15 +294,16 @@ public:
       }
       currentInstructionIndex++;
 
-      logs.push_back(GetTimestamp() + " Core:" + std::to_string(coreNum) +
-                     " \"SLEEP " + (stmt.args.empty() ? "0" : stmt.args[0]) +
-                     "\"");
+      AppendLog(GetTimestamp() + " Core:" + std::to_string(coreNum) +
+                " \"SLEEP " + (stmt.args.empty() ? "0" : stmt.args[0]) + "\"");
 
       if (currentInstructionIndex >= (int)statements.size() &&
           cyclesRemainingForSleep == 0) {
         currentState = FINISHED;
         if (finishTime.empty())
           finishTime = GetTimestamp();
+        ReleaseInstructions();
+        return {};
       }
       return statements;
     }
@@ -263,7 +330,8 @@ public:
       if (finishTime.empty()) {
         finishTime = lastViolationTime;
       }
-      return statements;
+      ReleaseInstructions();
+      return {};
     }
 
     if (!interpreter.GetLastInstructionPageFault() &&
@@ -277,14 +345,16 @@ public:
 
     auto output = interpreter.FlushBuffer();
     for (const auto &line : output) {
-      logs.push_back(GetTimestamp() + " Core:" + std::to_string(coreNum) +
-                     " \"" + line + "\"");
+      AppendLog(GetTimestamp() + " Core:" + std::to_string(coreNum) + " \"" +
+                line + "\"");
     }
 
     if (currentInstructionIndex >= (int)statements.size()) {
       currentState = FINISHED;
       if (finishTime.empty())
         finishTime = GetTimestamp();
+      ReleaseInstructions();
+      return {};
     }
 
     return statements;
@@ -323,7 +393,7 @@ public:
     std::ofstream outFile(filename);
     if (outFile.is_open()) {
       outFile << "Process name: " << processName << "\n";
-      for (const auto &log : logs) {
+      for (const auto &log : GetLogs()) {
         outFile << log << "\n";
       }
 
@@ -380,7 +450,10 @@ public:
    *
    * @return vector of logs
    */
-  std::vector<std::string> GetLogs() { return logs; }
+  std::vector<std::string> GetLogs() {
+    const std::lock_guard<std::mutex> guard(*logsMutex);
+    return logs;
+  }
 
   /**
    * @brief Gets the started time of a Process
@@ -425,32 +498,7 @@ public:
    *
    * @return total number of instrcutions in a process
    */
-  int GetTotalInstructions() {
-    return (int)statements.size();
-
-    // int total = 0;
-    // for (const auto &stmt : statements) {
-    //   if (stmt.keyword == Keyword::kFor) {
-    //     total += 1;
-
-    //     int m = 1;
-    //     if (stmt.args.size() >= 2) {
-    //       try {
-    //         m = std::stoi(stmt.args[1]);
-    //       } catch (...) {
-    //         m = 1;
-    //       }
-    //     }
-
-    //     int n = (int)stmt.nested.size();
-
-    //     total += (m * n);
-    //   } else {
-    //     total += 1;
-    //   }
-    // }
-    // return total;
-  }
+  int GetTotalInstructions() { return totalInstructions; }
 
   /**
    * @brief gets the core assigned
@@ -485,7 +533,12 @@ public:
    *
    * @param state the ProcessState to set
    */
-  void SetState(ProcessState state) { currentState = state; }
+  void SetState(ProcessState state) {
+    currentState = state;
+    if (state == FINISHED || state == TERMINATED) {
+      ReleaseInstructions();
+    }
+  }
 
   /**
    * @brief Gets the number of cycles remaining for the process to sleep

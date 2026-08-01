@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <iomanip>
@@ -194,6 +195,7 @@ public:
     std::lock_guard<std::mutex> lock(schedulerMutex);
     try {
       processes.push_back(p);
+      activeProcesses.push_back(p);
       processQueue.push(p);
       return p;
     } catch (const std::bad_alloc &e) {
@@ -568,6 +570,7 @@ public:
       std::lock_guard<std::mutex> lock(schedulerMutex);
       processQueue.push(p);
       processes.push_back(p);
+      activeProcesses.push_back(p);
 
       nextPID++;
     }
@@ -599,7 +602,7 @@ public:
    */
   void UpdateSleepingProcessesCycle() {
     std::lock_guard<std::mutex> lock(schedulerMutex);
-    for (Process *p : processes) {
+    for (Process *p : activeProcesses) {
       if (p != nullptr && p->GetState() == ProcessState::WAITING) {
         p->DecrementSleepCycles();
         if (p->GetCyclesRemainingForSleep() <= 0) {
@@ -692,12 +695,27 @@ public:
 private:
   AlgoContext ctx;
   std::thread schedulerThread;
+
+  /** Every process ever created, kept for "screen -ls" and report-util. */
   std::vector<prosched::Process *> processes;
+
+  /**
+   * @brief The processes that can still change state.
+   *
+   * The per-tick work (sleep countdowns, freeing the memory of processes that
+   * just ended) only concerns these, so it must not walk `processes`: that
+   * list only ever grows, and a long session would spend every tick revisiting
+   * thousands of processes that ended hours ago.
+   */
+  std::vector<prosched::Process *> activeProcesses;
+
   std::queue<prosched::Process *> processQueue;
   std::vector<Worker *> workers;
   std::mutex schedulerMutex;
-  bool running = false;
-  bool generatingProcesses = false;
+
+  // Read by the worker-facing threads while the CLI thread writes them.
+  std::atomic<bool> running{false};
+  std::atomic<bool> generatingProcesses{false};
   int nextPID = 1;
   std::mutex tickMutex;
   std::condition_variable tickCv;
@@ -737,20 +755,38 @@ private:
   }
 
   /**
-   * @brief Frees memory allocated to finished processes.
+   * @brief Frees the memory of processes that ended, then retires them.
+   *
+   * A process is released exactly once: it drops out of the active list in the
+   * same pass, so neither the free nor the scan is repeated on every later
+   * tick for the rest of the session.
    *
    * @note this is a new function @Stephen <----
    */
   void FreeFinishedProcesses() {
+    std::vector<int> endedPids;
+    {
+      std::lock_guard<std::mutex> lock(schedulerMutex);
+
+      auto stillActive = activeProcesses.begin();
+      for (Process *p : activeProcesses) {
+        if (p == nullptr) {
+          continue;
+        }
+        if (p->IsFinished()) {
+          endedPids.push_back(p->GetPID());
+          continue;
+        }
+        *stillActive++ = p;
+      }
+      activeProcesses.erase(stillActive, activeProcesses.end());
+    }
+
     if (!pagingManager) {
       return;
     }
-    std::lock_guard<std::mutex> lock(schedulerMutex);
-
-    for (Process *p : processes) {
-      if (p != nullptr && p->IsFinished()) {
-        pagingManager->FreeAllPagesForProcess(p->GetPID());
-      }
+    for (int pid : endedPids) {
+      pagingManager->FreeAllPagesForProcess(pid);
     }
   }
 
