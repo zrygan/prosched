@@ -1360,3 +1360,34 @@ TEST(InterpreterDeclareClamping, PipelineSilentlyDropsTheVariable) {
 }
 
 } // namespace InterpreterDeclareClamping
+// Found by mutation testing (2026-07-28): deleting the std::clamp in
+// ExecuteDeclare broke NO test. The WRITE side of the same rule is pinned by
+// InterpreterReadWriteHappyPath.WriteClampsUint16OverflowLikeDeclare (70000 ->
+// 65535), but nothing asserted it for DECLARE — the very instruction that test
+// is named after.
+//
+// MO2: "uint16 variables are clamped between (0, max(uint16))". Without the
+// clamp, static_cast<uint16_t>(70000) WRAPS to 4464 instead of saturating,
+// which is a silently wrong value rather than a crash.
+namespace InterpreterDeclareUint16Clamp {
+
+TEST(InterpreterDeclareUint16Clamp, AboveRangeSaturatesInsteadOfWrapping) {
+  prosched::Interpreter interp;
+  auto result =
+      interp.ExecuteDeclare(makeStmt(prosched::Keyword::kDeclare, {"a", "70000"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(*result, 65535)
+      << "70000 wrapped to " << *result
+      << " instead of saturating at 65535; a uint16 cast wraps, MO2 requires "
+         "clamping";
+}
+
+TEST(InterpreterDeclareUint16Clamp, BelowRangeSaturatesAtZero) {
+  prosched::Interpreter interp;
+  auto result =
+      interp.ExecuteDeclare(makeStmt(prosched::Keyword::kDeclare, {"a", "-5"}));
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(*result, 0) << "-5 must clamp to 0, not wrap to 65531";
+}
+
+} // namespace InterpreterDeclareUint16Clamp
