@@ -2152,36 +2152,38 @@ TEST(SchedulerFrameConservation, AllFramesReturnToFreeAfterEveryProcessFinishes)
 } // namespace SchedulerFrameConservation
 
 
-// ─── Frame starvation livelock ───────────────────────────────────────────────
+// ─── Frame starvation livelock (FIXED) ───────────────────────────────────────
 //
-// A single READ needs TWO pages resident at once: its data page, and page 0 for
-// the symbol-table segment that SetVariable touches via CheckSymbolTableAccess.
-// Nothing PINS a page an in-flight instruction has already faulted in, so each
-// core independently holds a half-satisfied instruction and evicts the pages the
-// other cores just faulted in.
+// HISTORICAL: a single READ used to need TWO pages resident at once - its data
+// page, and page 0 for the symbol-table segment that SetVariable touches via
+// CheckSymbolTableAccess. Nothing pinned a page an in-flight instruction had
+// already faulted in, so each core independently held a half-satisfied
+// instruction and evicted the pages the other cores had just faulted in.
 //
-// The threshold is therefore not "frames < pages per instruction" but
+// The threshold was therefore not "frames < pages per instruction" but
 //     frames < pages_per_instruction x concurrent_cores
-// because every busy core is fighting for its own pair of pages.
+// because every busy core fought for its own pair of pages.
 //
-// MEASURED with a 4-instruction program (WRITE/DECLARE/READ/ADD), 6 processes,
-// RR quantum 3, 6s budget:
+// MEASURED THEN with a 4-instruction program (WRITE/DECLARE/READ/ADD), 6
+// processes, RR quantum 3, 6s budget:
 //     cores=1  frames=2  COMPLETE      cores=2  frames=2  HUNG
 //     cores=2  frames=4  COMPLETE      cores=4  frames=2  HUNG
 //     cores=4  frames=8  COMPLETE      cores=4  frames=4  HUNG
 //     cores=8  frames=16 COMPLETE      cores=8  frames=4  HUNG
-// Exactly frames >= 2 x cores. A healthy run pages in ~12-17 times; a hung run
-// pages in ~800-990 times and retires NOTHING.
+// Exactly frames >= 2 x cores. A healthy run paged in ~12-17 times; a hung run
+// paged in ~800-990 times and retired NOTHING. The hung row cores=8/frames=4 IS
+// THE PROFESSOR'S MO2 DEMO 2 (max-overall-mem 1024 / mem-per-frame 256, num-cpu
+// 8), which made ZERO forward progress.
 //
-// THIS CONFIGURATION IS THE PROFESSOR'S MO2 DEMO 2: max-overall-mem 1024 /
-// mem-per-frame 256 = 4 frames, with num-cpu 8. It makes ZERO forward progress
-// — which is a different and worse diagnosis than "slow because of backing-store
-// I/O". MO2 requires page-fault handling to repeat "until a valid page has been
-// returned, before an instruction is performed"; it does not license the system
-// to never perform the instruction at all.
+// FIXED by the second of the two suggested remedies, in the interpreter rather
+// than the pager: Interpreter::ExecuteRead and ::ExecuteWrite latch whichever
+// half of the access succeeds first (see pending_read_value_ /
+// pending_write_value_), and the retry skips it. An instruction now never needs
+// two pages resident simultaneously, so pages_per_instruction is 1 and the
+// multiplier is gone - a machine with one frame per core makes progress.
 //
-// FIX: pin the pages an instruction has already faulted in until it retires, or
-// pre-page everything the instruction needs before running it.
+// The tests below stay as regression cover: DemoConfigMakesForwardProgress
+// pins the exact configuration that used to hang.
 namespace SchedulerFrameStarvation {
 
 TEST(SchedulerFrameStarvation, DemoConfigMakesForwardProgress) {
@@ -2238,25 +2240,28 @@ TEST(SchedulerFrameStarvation, DemoConfigMakesForwardProgress) {
 } // namespace SchedulerFrameStarvation
 // ─── Config viability ────────────────────────────────────────────────────────
 //
-// Bug H (SchedulerFrameStarvation) makes forward progress a property OF THE
-// CONFIG, not just of the code: frames must be >= pagesPerInstruction x cores,
-// where pagesPerInstruction is 2 normally (data page + symbol-table page) and 1
-// only when a whole process fits inside one frame.
+// Forward progress used to be a property OF THE CONFIG and not just of the
+// code: while an instruction needed two pages at once, frames had to be
+// >= 2 x cores or the machine livelocked (see SchedulerFrameStarvation).
 //
-// MEASURED across the memory dimensions, generation ON, 400 ms each:
+// MEASURED THEN across the memory dimensions, generation ON, 400 ms each:
 //   frame=256 procMem=512  overall=1024 ->  4 frames /8 cores -> 0 finished
 //   frame=64  procMem=256  overall=256  ->  4 frames /8 cores -> 0 finished
 //   frame=64  procMem=256  overall=512  ->  8 frames /8 cores -> 2 finished
 //   frame=64  procMem=256  overall=1024 -> 16 frames /8 cores -> 3 finished
 //   frame=16  procMem=4096 overall=16384-> 1024 frames        -> 128-182 finished
-// The last row is the SHIPPED prosched/config.txt, which is healthy. These
-// tests pin that so a config edit cannot silently reintroduce a frozen demo.
+//
+// That multiplier is GONE now that READ and WRITE latch their partial progress,
+// so the arithmetic rule these tests used to assert has been dropped: the first
+// two rows above complete today. What remains worth pinning is the behaviour
+// itself - whatever is in config.txt must actually retire processes - so the
+// check is the run, not a formula predicting it.
 namespace SchedulerConfigViability {
 
 // Uses the real config.txt memory parameters and core count. It deliberately
-// substitutes a short fixed program for the config's min-ins/max-ins (5000), so
-// this checks the frames-vs-cores viability of the shipped config rather than
-// its instruction volume.
+// substitutes a short fixed program for the config's min-ins/max-ins, so this
+// checks the viability of the shipped memory settings rather than its
+// instruction volume.
 TEST(SchedulerConfigViability, ShippedConfigMemorySettingsAllowForwardProgress) {
   ConfigStruct *cs = fromFile();
   ASSERT_NE(cs, nullptr) << "run the suite from the repo root; CONFIG_FILENAME "
@@ -2273,10 +2278,9 @@ TEST(SchedulerConfigViability, ShippedConfigMemorySettingsAllowForwardProgress) 
 
   ASSERT_GT(frame, 0);
   const int frames = overall / frame;
-  EXPECT_GE(frames, 2 * cores)
-      << "shipped config.txt gives " << frames << " frames for " << cores
-      << " cores; below 2 x cores the scheduler livelocks (see "
-         "SchedulerFrameStarvation)";
+  ASSERT_GE(frames, 1) << "shipped config.txt gives " << frames
+                       << " frames for " << cores
+                       << " cores; a machine with no frames cannot run at all";
 
   prosched::PagingManager pm(frame, overall);
   prosched::Scheduler sched(ctx, &pm);
@@ -2315,9 +2319,10 @@ TEST(SchedulerConfigViability, ShippedConfigMemorySettingsAllowForwardProgress) 
       ++unfinished;
   sched.Stop();
 
-  EXPECT_TRUE(allDone) << unfinished
+  EXPECT_TRUE(allDone) << unfinished << " of " << procs.size()
                        << " processes never retired under the shipped config's "
-                          "memory settings";
+                       << "memory settings (" << frames << " frames, " << cores
+                       << " cores, " << procMem << " B per process)";
 }
 
 // MO1/MO2 keep num-cpu in [1, 128]. Both bounds were untested, and vmstat's

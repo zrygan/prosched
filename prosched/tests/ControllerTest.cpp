@@ -1,5 +1,8 @@
 #include "controller/Controller.h"
 #include "Constants.hpp"
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <gtest/gtest.h>
 
 namespace ControllerIdentifyCommand {
@@ -158,6 +161,30 @@ TEST(ControllerHandlePreInit, InitializeInputReturnsTrue) {
 //   num-cpu 4  |  scheduler fcfs  |  quantum-cycles 5  |  batch-process-freq 1
 //   min-ins 1000  |  max-ins 2000  |  delay-per-exec 0
 
+
+// initialize() reads prosched/config.txt, whose values are demo parameters the
+// MO2 quiz changes without a recompile. These tests check that each key reaches
+// the matching AlgoContext field, so the expected value comes from the file
+// rather than from a literal that a config edit would falsify.
+namespace {
+
+int ConfigValue(const std::string &key) {
+  std::ifstream file(CONFIG_FILENAME);
+  std::string line;
+  while (std::getline(file, line)) {
+    std::istringstream parts(line);
+    std::string fileKey, value;
+    if (parts >> fileKey >> value && fileKey == key) {
+      return std::stoi(value);
+    }
+  }
+  ADD_FAILURE() << "config.txt has no \"" << key << "\" line; run the suite "
+                << "from the repo root so " << CONFIG_FILENAME << " resolves";
+  return -1;
+}
+
+} // namespace
+
 namespace ControllerInitialize {
 
 // "rr" in config.txt maps to SchedulerType::RR enum
@@ -167,50 +194,50 @@ TEST(ControllerInitialize, ReturnsCorrectSchedulerType) {
   EXPECT_EQ(ctx.schedulerType, SchedulerType::RR);
 }
 
-// num-cpu 4 from config.txt is read into num_cpu
+// num-cpu from config.txt is read into num_cpu
 TEST(ControllerInitialize, ReturnsCorrectnum_cpu) {
   Controller c;
   AlgoContext ctx = c.initialize();
-  EXPECT_EQ(ctx.num_cpu, 4);
+  EXPECT_EQ(ctx.num_cpu, ConfigValue("num-cpu"));
 }
 
-// batch-process-freq 1 from config.txt is read into batch_process_frequency
+// batch-process-freq from config.txt is read into batch_process_frequency
 TEST(ControllerInitialize, ReturnsCorrectbatch_process_frequency) {
   Controller c;
   AlgoContext ctx = c.initialize();
-  EXPECT_EQ(ctx.batch_process_frequency, 1);
+  EXPECT_EQ(ctx.batch_process_frequency, ConfigValue("batch-process-freq"));
 }
 
 // min-ins and max-ins are read together as the instruction range
 TEST(ControllerInitialize, ReturnsCorrectInstructionBounds) {
   Controller c;
   AlgoContext ctx = c.initialize();
-  EXPECT_EQ(ctx.min_ins, 5000);
-  EXPECT_EQ(ctx.max_ins, 5000);
+  EXPECT_EQ(ctx.min_ins, ConfigValue("min-ins"));
+  EXPECT_EQ(ctx.max_ins, ConfigValue("max-ins"));
 }
 
 // config.txt uses rr, so quantum-cycles 5 is read into rr_quantum_cycles
 TEST(ControllerInitialize, ReturnsCorrectrr_quantum_cycles) {
   Controller c;
   AlgoContext ctx = c.initialize();
-  EXPECT_EQ(ctx.rr_quantum_cycles, 5);
+  EXPECT_EQ(ctx.rr_quantum_cycles, ConfigValue("quantum-cycles"));
 }
 
-// delay-per-exec 3 from config.txt is read into delay_per_execution
+// delay-per-exec from config.txt is read into delay_per_execution
 TEST(ControllerInitialize, ReturnsCorrectdelay_per_execution) {
   Controller c;
   AlgoContext ctx = c.initialize();
-  EXPECT_EQ(ctx.delay_per_execution, 3);
+  EXPECT_EQ(ctx.delay_per_execution, ConfigValue("delay-per-exec"));
 }
 
 // Memory settings from config.txt are read into the context
 TEST(ControllerInitialize, ReturnsCorrectMemorySettings) {
   Controller c;
   AlgoContext ctx = c.initialize();
-  EXPECT_EQ(ctx.min_mem_per_proc, 4096);
-  EXPECT_EQ(ctx.max_mem_per_proc, 4096);
-  EXPECT_EQ(ctx.mem_per_frame, 16);
-  EXPECT_EQ(ctx.max_overall_mem, 16384);
+  EXPECT_EQ(ctx.min_mem_per_proc, ConfigValue("min-mem-per-proc"));
+  EXPECT_EQ(ctx.max_mem_per_proc, ConfigValue("max-mem-per-proc"));
+  EXPECT_EQ(ctx.mem_per_frame, ConfigValue("mem-per-frame"));
+  EXPECT_EQ(ctx.max_overall_mem, ConfigValue("max-overall-mem"));
 }
 
 // UNKNOWN means fromFile() failed (config.txt not found) or unrecognized

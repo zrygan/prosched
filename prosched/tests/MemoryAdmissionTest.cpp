@@ -169,6 +169,117 @@ TEST(SchedulerMemoryAdmission, CoresInUseNeverExceedsAvailableFrames) {
          "means the extras are occupying cores they cannot use.";
 }
 
+// The other side of admission control: a process BIGGER than physical memory
+// must still run, because demand paging exists precisely so that it can. The
+// program here is pure PRINT, so it needs no pages at all - if it does not
+// finish, the memory check refused it, not the pager.
+TEST(SchedulerMemoryAdmission, ProcessLargerThanPhysicalMemoryStillRuns) {
+  prosched::PagingManager pm(256, 256);
+  ASSERT_EQ(pm.GetTotalFrameCount(), 1) << "precondition: a single frame";
+
+  prosched::Scheduler scheduler(
+      makeMemoryCtx(/*num_cpu=*/1, /*quantum=*/10, /*memPerProc=*/256,
+                    /*memPerFrame=*/256, /*maxOverallMem=*/256, /*minIns=*/1,
+                    /*maxIns=*/1000, /*delay=*/0),
+      &pm);
+
+  prosched::Statement print;
+  print.keyword = prosched::Keyword::kPrint;
+  print.args = {"\"hello\""};
+  const std::vector<prosched::Statement> program(5, print);
+
+  // 2048 bytes = 8 pages against 1 frame: paging's whole job.
+  prosched::Process *p =
+      scheduler.CreateProcessWithInstructions("big", 2048, program);
+  ASSERT_NE(p, nullptr);
+  ASSERT_NE(scheduler.AddProcess(p), nullptr);
+
+  ASSERT_TRUE(scheduler.Start());
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < deadline && !p->IsFinished()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  const bool finished = p->IsFinished();
+  const int reached = p->GetCurrentInstructionIndex();
+  scheduler.Stop();
+
+  EXPECT_TRUE(finished)
+      << "a 2048-byte process on a 256-byte machine retired " << reached
+      << " of 5 PRINT instructions in 2 s. The dispatch guard compares the "
+         "process's entire size against max-overall-mem, so any process larger "
+         "than physical memory is permanently unschedulable - it never reaches "
+         "a core, never faults, and sits in the ready queue forever. Under "
+         "demand paging the size of the address space must not gate dispatch; "
+         "only the frames an instruction actually needs do.";
+}
+
+// The handler Scheduler::attachPaging installs answers one question - "may this
+// access proceed?" - about two different failures. A page that was just brought
+// in still costs the instruction a restart; a page that could NOT be brought in
+// because every frame is pinned elsewhere is not there to touch at all. Both
+// must abandon the instruction.
+//
+// Returning PageIn's own result conflated them: a failed page-in read as "no
+// fault" and the access went ahead. Interpreter::CheckAccess has a
+// `|| IsPagedOut(page)` clause that catches this, but only for a page that was
+// once resident and got evicted - paged_out_pages_ has no entry for a page that
+// never made it into a frame in the first place, which is exactly the case a
+// failed page-in produces.
+TEST(SchedulerMemoryAdmission, WriteToAPageThatCannotBePagedInDoesNotSucceed) {
+  prosched::PagingManager pm(64, 64);
+  ASSERT_EQ(pm.GetTotalFrameCount(), 1) << "precondition: a single frame";
+
+  prosched::Scheduler scheduler(
+      makeMemoryCtx(/*num_cpu=*/1, /*quantum=*/10, /*memPerProc=*/128,
+                    /*memPerFrame=*/64, /*maxOverallMem=*/64, /*minIns=*/1,
+                    /*maxIns=*/1000, /*delay=*/0),
+      &pm);
+
+  // 0x40 = 64 is page 1 at a 64-byte page size, and the operand is a literal,
+  // so this instruction touches that one page and nothing else.
+  prosched::Process *writer = scheduler.CreateProcessWithInstructions(
+      "writer", 128, {WriteStmt("0x40", "7")});
+  prosched::Process *holder = scheduler.CreateProcessWithInstructions(
+      "holder", 64, {WriteStmt("0x0", "1")});
+  ASSERT_NE(writer, nullptr);
+  ASSERT_NE(holder, nullptr);
+
+  // Hand the machine's only frame to the holder and pin it, so the writer's
+  // page can never be brought in. Nothing here has ever made page 1 resident.
+  ASSERT_TRUE(pm.PageIn(holder->GetPID(), 0));
+  pm.PinPage(holder->GetPID(), 0);
+  ASSERT_FALSE(pm.IsPageResident(writer->GetPID(), 1));
+
+  writer->ExecuteInstructions(0);
+
+  EXPECT_TRUE(writer->GetLastInstructionWasPageFault())
+      << "the only frame is pinned by another process, so paging in the "
+         "writer's page must have failed - that is a fault, not a clear "
+         "access";
+  EXPECT_EQ(writer->GetCurrentInstructionIndex(), 0)
+      << "the WRITE retired against a page that holds no frame";
+
+  const auto written =
+      writer->GetInterpreter().GetPageSnapshot(/*pageBase=*/64, /*size=*/64);
+  EXPECT_TRUE(written.empty())
+      << "the WRITE stored " << written.size()
+      << " value(s) into a page with no frame behind it. Physical memory was "
+         "never allocated for it, so this is a write to memory the process "
+         "does not own; it also survives into the backing store the moment "
+         "that page is ever paged out.";
+
+  // Control: with the pin released the same instruction completes, which shows
+  // the fault above came from the unavailable frame and not from the address.
+  pm.UnpinPage(holder->GetPID(), 0);
+  for (int tick = 0; tick < 5 && writer->GetCurrentInstructionIndex() == 0;
+       ++tick) {
+    writer->ExecuteInstructions(0);
+  }
+  EXPECT_EQ(writer->GetCurrentInstructionIndex(), 1)
+      << "once a frame could be freed the WRITE should have retired";
+}
+
 } // namespace SchedulerMemoryAdmission
 
 namespace WorkerPageFaultRelease {

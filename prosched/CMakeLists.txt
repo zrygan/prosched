@@ -50,6 +50,8 @@ add_executable(prosched_tests
   tests/ConfigTest.cpp
   tests/PagingManagerTest.cpp
   tests/MemoryAdmissionTest.cpp
+  tests/PinLifecycleTest.cpp
+  tests/UserProgramPagingTest.cpp
   # Controller, View and the interpreter are not header-only; their
   # implementations must be linked
   src/controller/Controller.cpp

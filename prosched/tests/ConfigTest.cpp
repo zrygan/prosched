@@ -2,6 +2,8 @@
 #include "Context.h"
 #include <cstdio>
 #include <fstream>
+#include <map>
+#include <string>
 #include <gtest/gtest.h>
 #include <sstream>
 
@@ -93,11 +95,44 @@ TEST(ConfigMakeDefault, max_overall_memIsDefault) {
 
 } // namespace ConfigMakeDefault
 
-// Expected values from prosched/config.txt:
-//   num-cpu 4  |  scheduler rr  |  quantum-cycles 5  |  batch-process-freq 1
-//   min-ins 5000  |  max-ins 5000  |  delay-per-exec 3
-//   min-mem-per-proc 4096  |  max-mem-per-proc 4096
-//   mem-per-frame 16  |  max-overall-mem 16384
+// These tests check that fromFile() carries each key in prosched/config.txt
+// into the matching field - not that config.txt holds any particular numbers.
+// The values there are demo parameters and the MO2 quiz changes them without a
+// recompile, so asserting literals turned a config edit into a dozen failures
+// that said nothing about the parser. The expected value is read back out of
+// the file instead, by a reader with no code in common with the one under test.
+namespace {
+
+// Reads config.txt as plain "key value" lines, the way the file is written.
+std::map<std::string, std::string> ReadConfigFileDirectly() {
+  std::map<std::string, std::string> entries;
+  std::ifstream file(CONFIG_FILENAME);
+  std::string line;
+  while (std::getline(file, line)) {
+    std::istringstream parts(line);
+    std::string key, value;
+    if (parts >> key >> value) {
+      entries[key] = value;
+    }
+  }
+  return entries;
+}
+
+// The value config.txt gives for a key, as an int. Fails the calling test when
+// the key is missing rather than silently comparing against a default.
+int ConfigFileInt(const std::string &key) {
+  const std::map<std::string, std::string> entries = ReadConfigFileDirectly();
+  const auto it = entries.find(key);
+  EXPECT_NE(it, entries.end())
+      << "config.txt has no \"" << key << "\" line; run the suite from the "
+      << "repo root so " << CONFIG_FILENAME << " resolves";
+  if (it == entries.end()) {
+    return -1;
+  }
+  return std::stoi(it->second);
+}
+
+} // namespace
 
 namespace ConfigFromFile {
 
@@ -108,11 +143,11 @@ TEST(ConfigFromFile, ValidFileReturnsNonNull) {
   delete cs;
 }
 
-// "num-cpu 4" in config.txt is parsed to num_cpu
+// "num-cpu" from config.txt is parsed to num_cpu
 TEST(ConfigFromFile, Parsesnum_cpu) {
   ConfigStruct *cs = fromFile();
   ASSERT_NE(cs, nullptr);
-  EXPECT_EQ(cs->num_cpu, 4);
+  EXPECT_EQ(cs->num_cpu, ConfigFileInt("num-cpu"));
   delete cs;
 }
 
@@ -124,75 +159,75 @@ TEST(ConfigFromFile, ParsesScheduler) {
   delete cs;
 }
 
-// "quantum-cycles 5" is parsed to rr_quantum_cycles
+// "quantum-cycles" from config.txt is parsed to rr_quantum_cycles
 TEST(ConfigFromFile, Parsesrr_quantum_cycles) {
   ConfigStruct *cs = fromFile();
   ASSERT_NE(cs, nullptr);
-  EXPECT_EQ(cs->rr_quantum_cycles, 5);
+  EXPECT_EQ(cs->rr_quantum_cycles, ConfigFileInt("quantum-cycles"));
   delete cs;
 }
 
-// "batch-process-freq 1" is parsed to batch_process_freq
+// "batch-process-freq" from config.txt is parsed to batch_process_freq
 TEST(ConfigFromFile, Parsesbatch_process_frequency) {
   ConfigStruct *cs = fromFile();
   ASSERT_NE(cs, nullptr);
-  EXPECT_EQ(cs->batch_process_freq, 1);
+  EXPECT_EQ(cs->batch_process_freq, ConfigFileInt("batch-process-freq"));
   delete cs;
 }
 
-// "min-ins 5000" is parsed to min_ins
+// "min-ins" from config.txt is parsed to min_ins
 TEST(ConfigFromFile, Parsesmin_ins) {
   ConfigStruct *cs = fromFile();
   ASSERT_NE(cs, nullptr);
-  EXPECT_EQ(cs->min_ins, 5000);
+  EXPECT_EQ(cs->min_ins, ConfigFileInt("min-ins"));
   delete cs;
 }
 
-// "max-ins 5000" is parsed to max_ins
+// "max-ins" from config.txt is parsed to max_ins
 TEST(ConfigFromFile, Parsesmax_ins) {
   ConfigStruct *cs = fromFile();
   ASSERT_NE(cs, nullptr);
-  EXPECT_EQ(cs->max_ins, 5000);
+  EXPECT_EQ(cs->max_ins, ConfigFileInt("max-ins"));
   delete cs;
 }
 
-// "delay-per-exec 3" is parsed to delay_per_exec
+// "delay-per-exec" from config.txt is parsed to delay_per_exec
 TEST(ConfigFromFile, Parsesdelay_per_execution) {
   ConfigStruct *cs = fromFile();
   ASSERT_NE(cs, nullptr);
-  EXPECT_EQ(cs->delay_per_exec, 3);
+  EXPECT_EQ(cs->delay_per_exec, ConfigFileInt("delay-per-exec"));
   delete cs;
 }
 
-// "min-mem-per-proc 4096" is parsed to min_mem_per_proc
+// "min-mem-per-proc" from config.txt is parsed to min_mem_per_proc
 TEST(ConfigFromFile, Parsesmin_mem_per_proc) {
   ConfigStruct *cs = fromFile();
   ASSERT_NE(cs, nullptr);
-  EXPECT_EQ(cs->min_mem_per_proc, 4096);
+  EXPECT_EQ(cs->min_mem_per_proc, ConfigFileInt("min-mem-per-proc"));
   delete cs;
 }
 
-// "max-mem-per-proc 4096" is parsed to max_mem_per_proc
+// "max-mem-per-proc" from config.txt is parsed to max_mem_per_proc
 TEST(ConfigFromFile, Parsesmax_mem_per_proc) {
   ConfigStruct *cs = fromFile();
   ASSERT_NE(cs, nullptr);
-  EXPECT_EQ(cs->max_mem_per_proc, 4096);
+  EXPECT_EQ(cs->max_mem_per_proc, ConfigFileInt("max-mem-per-proc"));
   delete cs;
 }
 
-// "mem-per-frame 16" is parsed to mem_per_frame
+// "mem-per-frame" from config.txt is parsed to mem_per_frame
 TEST(ConfigFromFile, Parsesmem_per_frame) {
   ConfigStruct *cs = fromFile();
   ASSERT_NE(cs, nullptr);
-  EXPECT_EQ(cs->mem_per_frame, 16);
+  EXPECT_EQ(cs->mem_per_frame, ConfigFileInt("mem-per-frame"));
   delete cs;
 }
 
-// "max-overall-mem 16384" is parsed to max_overall_mem
+// "max-overall-mem" from config.txt is parsed to max_overall_mem
 TEST(ConfigFromFile, Parsesmax_overall_mem) {
   ConfigStruct *cs = fromFile();
   ASSERT_NE(cs, nullptr);
-  EXPECT_EQ(cs->max_overall_mem, 16384);
+  EXPECT_EQ(cs->max_overall_mem, ConfigFileInt("max-overall-mem"));
   delete cs;
 }
 
