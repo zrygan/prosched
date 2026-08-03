@@ -2520,3 +2520,74 @@ TEST(SchedulerPidAllocation, PidsAreNotConsumedWhileIdle) {
 }
 
 } // namespace SchedulerPidAllocation
+
+// ─── screen -c instruction cap ───────────────────────────────────────────────
+//
+// Commit 48c74ab (and its follow-up 5bc7364) taught the GENERATED path to
+// respect max-ins: generateProcess and CreateNamedProcess draw until the STORED
+// instruction count reaches the target, accounting for how far a FOR unrolls.
+//
+// CreateProcessWithInstructions — the "screen -c" path — never got that. It
+// simply loops:
+//     for (Statement instruction : instructions) p->AddInstruction(instruction);
+// with no cap and no check, and AddInstruction unrolls a FOR recursively.
+//
+// So this is not a bound I am inventing: the codebase already decided what the
+// limit is and enforces it on one path. This asserts the other path agrees.
+// (Same shape of argument as InterpreterDeclareClamping, where WRITE already
+// clamped and DECLARE did not.)
+//
+// MEASURED, one user instruction at three nesting levels:
+//     repeats=10 ->     1,000 stored
+//     repeats=30 ->    27,000 stored
+//     repeats=50 ->   125,000 stored
+// Extrapolating, `screen -c p 64 "FOR([FOR([FOR([PRINT(\"x\")],9999)],9999)],9999)"`
+// is a ~55-character command that exhausts memory inside AddInstruction, before
+// the scheduler ever runs it. Growth measurements live in
+// ProcessForBodyFromUserProgram.DISABLED_ForUnrollGrowthIsUnbounded.
+//
+// repeats=50 is deliberate: enough to blow past the cap by 250x while keeping
+// the test itself to ~13 MB and a fraction of a second.
+namespace SchedulerUserProgramCap {
+
+TEST(SchedulerUserProgramCap, ScreenDashCRespectsTheSameCapAsGeneratedProcesses) {
+  ConfigStruct *cs = makeDefault();
+  cs->scheduler = "fcfs";
+  cs->batch_process_freq = 1000000; // no auto-generation
+  cs->min_ins = 500;
+  cs->max_ins = 500; // exact, so the cap is unambiguous
+  AlgoContext ctx = AlgoContext::buildConfig(cs);
+  delete cs;
+
+  prosched::Scheduler scheduler(ctx);
+
+  // Control: the generated path already honours the cap.
+  prosched::Process *generated = scheduler.CreateNamedProcess("gen", 256);
+  ASSERT_NE(generated, nullptr);
+  EXPECT_LE(generated->GetTotalInstructions(), 500)
+      << "control: CreateNamedProcess is expected to respect max-ins";
+
+  // The screen -c path, with a program that unrolls far past the cap.
+  std::vector<prosched::Statement> program;
+  prosched::Interpreter parser;
+  ASSERT_TRUE(parser.ParseUserProgram(
+      "FOR([FOR([FOR([PRINT(\"x\")], 50)], 50)], 50)", program));
+  ASSERT_EQ(program.size(), 1u) << "precondition: this is ONE user instruction";
+
+  prosched::Process *user =
+      scheduler.CreateProcessWithInstructions("usr", 256, program);
+  ASSERT_NE(user, nullptr);
+  const int stored = user->GetTotalInstructions();
+
+  delete generated;
+  delete user;
+
+  EXPECT_LE(stored, 500)
+      << "one screen -c instruction expanded to " << stored
+      << " stored instructions against a max-ins of 500. "
+         "CreateProcessWithInstructions applies no cap, while "
+         "CreateNamedProcess (the control above) does - so the same program is "
+         "bounded when generated and unbounded when typed by a user.";
+}
+
+} // namespace SchedulerUserProgramCap

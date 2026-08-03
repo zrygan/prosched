@@ -1024,6 +1024,11 @@ namespace ProcessForBodyFromUserProgram {
 // instruction check, then hangs or OOMs the emulator inside AddInstruction,
 // before the scheduler ever runs it.
 //
+// This stays a MEASUREMENT (it records the growth curve). The GATE that
+// fails on the defect is SchedulerUserProgramCap.ScreenDashCRespectsTheSameCapAsGeneratedProcesses
+// in SchedulerTest.cpp, which asserts screen -c honours the same max-ins cap
+// the generated path already enforces.
+//
 // Run: --gtest_also_run_disabled_tests --gtest_filter='*UnrollGrowth*'
 TEST(ProcessForBodyFromUserProgram, DISABLED_ForUnrollGrowthIsUnbounded) {
   for (int r : {10, 30, 50}) {
