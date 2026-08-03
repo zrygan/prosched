@@ -550,9 +550,9 @@ void Controller::PrintVmStat() {
   const prosched::Scheduler::CpuTickStats ticks =
       this->scheduler->GetCpuTickStats();
 
-  PrintVmStatRow(std::cout, memory.totalMemoryBytes, "KB", "total memory");
-  PrintVmStatRow(std::cout, memory.usedMemoryBytes, "KB", "used memory");
-  PrintVmStatRow(std::cout, memory.freeMemoryBytes, "KB", "free memory");
+  PrintVmStatRow(std::cout, memory.totalMemoryBytes, prosched::kMemoryUnit, "total memory");
+  PrintVmStatRow(std::cout, memory.usedMemoryBytes, prosched::kMemoryUnit, "used memory");
+  PrintVmStatRow(std::cout, memory.freeMemoryBytes, prosched::kMemoryUnit, "free memory");
   PrintVmStatRow(std::cout, ticks.idleCpuTicks, "", "idle CPU ticks");
   PrintVmStatRow(std::cout, ticks.activeCpuTicks, "", "active CPU ticks");
   PrintVmStatRow(std::cout, ticks.totalCpuTicks, "", "total CPU ticks");
@@ -581,8 +581,8 @@ void Controller::PrintProcessSmi() {
 
   std::cout << "CPU-Util: " << static_cast<int>(this->scheduler->GetCpuUtilization())
             << "%\n";
-  std::cout << "Memory Usage: " << memory.usedMemoryBytes << "KB / "
-            << memory.totalMemoryBytes << "KB\n";
+  std::cout << "Memory Usage: " << memory.usedMemoryBytes <<  prosched::kMemoryUnit<< " / "
+            << memory.totalMemoryBytes << prosched::kMemoryUnit << "\n";
   std::cout << "Memory Util: " << static_cast<int>(memoryUtil) << "%\n\n";
 
   std::cout << std::string(kProcessSmiRule.size(), '=') << "\n";
@@ -597,7 +597,7 @@ void Controller::PrintProcessSmi() {
     anyRunning = true;
     std::cout << p->GetName() << " "
               << this->pagingManager->GetProcessMemoryBytes(p->GetPID())
-              << "KB\n";
+              << prosched::kMemoryUnit << "\n";
   }
   if (!anyRunning) {
     std::cout << "(none)\n";
