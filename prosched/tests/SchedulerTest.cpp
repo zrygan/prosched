@@ -1763,7 +1763,7 @@ TEST(SchedulerRetentionPerf, DISABLED_FinishedProcessesReleaseTheirInstructions)
   // owns a vector<string> of arguments whose heap blocks are not counted here.
   const long bytes = retained * static_cast<long>(sizeof(prosched::Statement));
   std::cout << "  " << kProcesses << " finished processes retain " << retained
-            << " Statement objects, >= " << (bytes / 1024 / 1024) << " MiB\n"
+            << " Statement objects, >= " << (bytes / 1024 / 1024) << " KB\n"
             << "  (demo 2 generates one process per tick for 10 s, so this is a"
                " small fraction of the real total)\n";
 
