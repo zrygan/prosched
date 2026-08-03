@@ -607,6 +607,19 @@ public:
   int GetCyclesRemainingForSleep() const { return cyclesRemainingForSleep; }
 
   /**
+   * @brief Sets the number of cycles the process stays off a core
+   *
+   * SLEEP sets this from its own operand; the worker also uses it for the
+   * delay-per-exec stall, which is the same thing from the scheduler's point of
+   * view - a process that is not runnable for a fixed number of ticks.
+   *
+   * @param numCycles cycles to remain non-runnable; negative values clamp to 0
+   */
+  void SetCyclesRemainingForSleep(int numCycles) {
+    cyclesRemainingForSleep = numCycles > 0 ? numCycles : 0;
+  }
+
+  /**
    * @brief Decrements the number of cycles remaining for the process to sleep
    *
    * This function reduces the cyclesRemainingForSleep by one, ensuring it does

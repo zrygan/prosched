@@ -115,6 +115,7 @@ public:
 
     running = true;
     generatingProcesses = false;
+    lastTickBusyCores = 0;
 
     for (int i = 0; i < this->ctx.num_cpu; i++) {
       Worker *w = new Worker(i, ctx);
@@ -217,13 +218,8 @@ public:
 
     std::lock_guard<std::mutex> lock(schedulerMutex);
 
-    int coresUsed = 0, coresAvail = 0;
-    for (Worker *w : workers) {
-      if (w->IsBusy())
-        coresUsed++;
-      else
-        coresAvail++;
-    }
+    const int coresUsed = CoresInUse();
+    const int coresAvail = static_cast<int>(workers.size()) - coresUsed;
     double utilization =
         workers.empty()
             ? 0.0
@@ -424,14 +420,28 @@ public:
     if (workers.empty()) {
       return 0.0;
     }
+    return (static_cast<double>(CoresInUse()) / workers.size()) * 100.0;
+  }
 
-    int coresUsed = 0;
-    for (Worker *w : workers) {
-      if (w->IsBusy()) {
-        coresUsed++;
-      }
-    }
-    return (static_cast<double>(coresUsed) / workers.size()) * 100.0;
+  /**
+   * @brief Cores that were holding a process at the start of the current tick.
+   *
+   * Deliberately not a live poll of the workers. A core is handed back the
+   * instant its process stops executing - it finishes, sleeps, or begins a
+   * delay-per-exec stall - and is refilled from the ready queue later in the
+   * same tick, so a live poll taken from the CLI thread lands almost every time
+   * inside that gap and reports cores as free while the machine is saturated.
+   * Reading the tick's own count instead makes "screen -ls" agree with the
+   * active/idle tick totals that "vmstat" reports, because both are now sampled
+   * at the same point.
+   *
+   * @return busy core count as of the last tick, clamped to the current core
+   * count so a stopped scheduler cannot report more cores than it has
+   */
+  int CoresInUse() const {
+    const int busy = lastTickBusyCores.load();
+    const int cores = static_cast<int>(workers.size());
+    return busy < cores ? busy : cores;
   }
 
   /**
@@ -671,18 +681,21 @@ public:
       workersCompleted = 0;
     }
 
+    int busy = 0;
     for (Worker *w : workers) {
       {
         std::lock_guard<std::mutex> statsLock(cpuStatsMutex);
         totalCpuTicks++;
         if (w->IsBusy()) {
           activeCpuTicks++;
+          busy++;
         } else {
           idleCpuTicks++;
         }
       }
       w->SignalNewTick(cpuCycles);
     }
+    lastTickBusyCores = busy;
 
     std::unique_lock<std::mutex> lock(tickMutex);
     tickCv.wait(lock, [this] {
@@ -747,6 +760,10 @@ private:
   std::mutex tickMutex;
   std::condition_variable tickCv;
   int workersCompleted = 0;
+
+  // Busy cores as of the last tick; read by the CLI thread. See CoresInUse.
+  std::atomic<int> lastTickBusyCores{0};
+
   PagingManager *pagingManager = nullptr;
   mutable std::mutex cpuStatsMutex;
   std::uint64_t totalCpuTicks = 0;

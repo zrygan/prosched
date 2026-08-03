@@ -297,8 +297,18 @@ public:
         return;
       }
 
-      if(!p->GetLastInstructionWasPageFault()){
-        p->SetCurrentInstructionCyclesLeft(ctx.delay_per_execution);
+      if (!p->GetLastInstructionWasPageFault() &&
+          ctx.delay_per_execution > 0) {
+        // The stall between two instructions is time this process is not
+        // running, so the core goes back to the scheduler for the duration
+        // instead of being held down by a process that executes nothing. Held
+        // down, one process's stalls are counted as CPU utilization and no
+        // other process can use the core, so a single core can never catch up
+        // with its ready queue once delay-per-exec is above zero.
+        p->ReleasePins();
+        p->SetCyclesRemainingForSleep(ctx.delay_per_execution);
+        p->SetState(ProcessState::WAITING);
+        currentProcess = nullptr;
       }
 
       return;

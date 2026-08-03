@@ -55,7 +55,7 @@ void CommandSet() {
             << "- screen -c <process name> <process memory size> "
                "\"<instructions>\"\n"
             << "- screen -ls\n"
-            << "- scheduler-start\n"
+            << "- scheduler-start (or scheduler-test)\n"
             << "- scheduler-stop\n"
             << "- report-util\n"
             << "- vmstat\n"

@@ -639,7 +639,9 @@ Controller::IdentifyCommand(const std::vector<std::string> &command) {
     return CLI_COMMAND::CLI_EXIT;
   } else if (command[0] == "clear") {
     return CLI_COMMAND::CLI_CLEAR;
-  } else if (command[0] == "scheduler-start") {
+  } else if (command[0] == "scheduler-start" ||
+             command[0] == "scheduler-test") {
+    // "scheduler-test" is the name the demo scripts use for the same thing.
     return CLI_COMMAND::CLI_SCHEDULER_START;
   } else if (command[0] == "scheduler-stop") {
     return CLI_COMMAND::CLI_SCHEDULER_STOP;
