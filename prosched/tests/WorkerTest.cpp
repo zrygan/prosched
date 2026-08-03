@@ -624,6 +624,45 @@ TEST(WorkerTickExecution, DetachesOnFinishedState) {
   EXPECT_FALSE(w.IsBusy());
 }
 
+// The delay-per-exec stall must hand the core back instead of holding it: a
+// stalling process executes nothing, so counting its stall as a busy core both
+// overstates CPU utilization and starves the ready queue. With min-ins 30 and
+// batch-process-freq 60, holding the core makes a single-core run saturate at
+// 100% forever for any delay >= 1, which no amount of waiting recovers from.
+TEST(WorkerTickExecution, DelayPerExecReleasesTheCore) {
+  AlgoContext ctx = makeTestCtx();
+  ctx.delay_per_execution = 3;
+  prosched::Worker w(1, ctx);
+  prosched::Process p("te_delay_1", 11, 0);
+  AddRaw(p, "PRINT(\"a\")");
+  AddRaw(p, "PRINT(\"b\")");
+
+  w.AssignProcess(&p);
+  w.TickExecution(&p); // first PRINT executes, then the stall begins
+
+  EXPECT_EQ(p.GetCurrentInstructionIndex(), 1);
+  EXPECT_FALSE(w.IsBusy());
+  EXPECT_EQ(p.GetState(), prosched::ProcessState::WAITING);
+  EXPECT_EQ(p.GetCyclesRemainingForSleep(), 3);
+}
+
+// A zero delay is the "execute every cycle" case, so the process keeps the core
+// and runs its next instruction on the next tick.
+TEST(WorkerTickExecution, ZeroDelayPerExecKeepsTheCore) {
+  AlgoContext ctx = makeTestCtx();
+  ctx.delay_per_execution = 0;
+  prosched::Worker w(1, ctx);
+  prosched::Process p("te_delay_2", 12, 0);
+  AddRaw(p, "PRINT(\"a\")");
+  AddRaw(p, "PRINT(\"b\")");
+
+  w.AssignProcess(&p);
+  w.TickExecution(&p);
+
+  EXPECT_TRUE(w.IsBusy());
+  EXPECT_EQ(p.GetState(), prosched::ProcessState::RUNNING);
+}
+
 } // namespace WorkerTickExecution
 
 // ─── WorkerRunCycle ───────────────────────────────────────────────────────

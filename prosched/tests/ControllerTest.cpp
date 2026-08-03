@@ -20,6 +20,14 @@ TEST(ControllerIdentifyCommand, SchedulerStart) {
             CLI_COMMAND::CLI_SCHEDULER_START);
 }
 
+// "scheduler-test" is the demo scripts' name for scheduler-start and must
+// start generation rather than being rejected as unknown
+TEST(ControllerIdentifyCommand, SchedulerTestIsAliasOfSchedulerStart) {
+  Controller c;
+  EXPECT_EQ(c.IdentifyCommand({"scheduler-test"}),
+            CLI_COMMAND::CLI_SCHEDULER_START);
+}
+
 // "scheduler-stop" token maps to CLI_SCHEDULER_STOP
 TEST(ControllerIdentifyCommand, SchedulerStop) {
   Controller c;
