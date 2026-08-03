@@ -484,8 +484,12 @@ public:
     attachPaging(p);
     p->SetOwnedByScheduler(true);
     p->SetPagingManager(this->pagingManager);
+    const int cap = this->ctx.max_ins;
     for (Statement instruction : instructions) {
-      p->AddInstruction(instruction);
+      if(p->GetTotalInstructions() >= cap) {
+        break;
+      }
+      p->AddInstruction(instruction, cap);
     }
     return p;
   }
@@ -765,7 +769,7 @@ private:
       const int wouldAdd = Process::CountExpandedInstructions(instruction);
       if (wouldAdd > 0 &&
           p->GetTotalInstructions() + wouldAdd <= commandAmount) {
-        p->AddInstruction(instruction);
+        p->AddInstruction(instruction, this->ctx.max_ins);
       }
     }
   }

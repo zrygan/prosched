@@ -188,7 +188,11 @@ public:
    * @return If adding a command is successful it returns the
    * specific statement, else unsuccessful return nullptr
    */
-  Statement *AddInstruction(Statement &stmt) {
+  Statement *AddInstruction(Statement &stmt, int cap = INT_MAX) {
+    if ((int)statements.size() >= cap){
+      return nullptr;
+    }
+
     try {
       if (stmt.keyword == Keyword::kUnknown) {
         return nullptr;
@@ -207,7 +211,10 @@ public:
         Statement *lastAdded = nullptr;
         for (int r = 0; r < repeats; r++) {
           for (auto &nested : stmt.nested) {
-            lastAdded = AddInstruction(nested);
+            if ((int)statements.size() >= cap){
+              return nullptr;
+            }
+            lastAdded = AddInstruction(nested, cap);
           }
         }
         return lastAdded;
@@ -629,7 +636,6 @@ public:
   void SetPagingManager(PagingManager* pm) {
     pagingManager = pm;
   }
-
 };
 
 } // namespace prosched
