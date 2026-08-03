@@ -269,6 +269,40 @@ public:
   }
 
   /**
+   * @brief Reserves room for an expected instruction count.
+   *
+   * A generated process is filled one statement at a time up to min-ins/max-ins,
+   * and every reallocation on the way copies each Statement already stored,
+   * along with the strings each one owns. The generator knows the final count
+   * up front, so the growth can be paid once. Purely an allocation hint: it
+   * changes no limit and no observable state.
+   *
+   * @param expectedInstructions The number of statements about to be added
+   */
+  void ReserveInstructions(int expectedInstructions) {
+    if (expectedInstructions > 0) {
+      statements.reserve(static_cast<std::size_t>(expectedInstructions));
+    }
+  }
+
+  /**
+   * @brief Drops every pin this process holds on physical frames.
+   *
+   * A pin exists only for the duration of the access that needs the page: it
+   * stops the pager from evicting a page out from under a running instruction.
+   * The moment the process is not mid-access - the instruction finished, the
+   * instruction was abandoned, or the process left its core - the pins must go,
+   * or the frames stay locked to a process that is not using them.
+   *
+   * Safe to call when the process has no pager or holds no pins.
+   */
+  void ReleasePins() {
+    if (pagingManager != nullptr) {
+      pagingManager->UnpinAllPagesForProcess(pid);
+    }
+  }
+
+  /**
    * @brief Executes the current instruction of the process on a CPU core.
    *
    * Executes one parsed Statement instruction. If it is the first statement,
@@ -338,6 +372,13 @@ public:
     interpreter.ExecuteStatements({stmt});
 
     if (interpreter.GetLastInstructionPageFault()) {
+      // The instruction is abandoned and will start over, so the pages it did
+      // manage to pin are not being read or written by anybody. Holding them
+      // pinned across the restart - and across the preemption that follows -
+      // takes those frames out of circulation while this process sits in the
+      // ready queue, which is how every frame ends up pinned by a process that
+      // is not running and PageIn starts refusing every request.
+      ReleasePins();
       interpreter.FlushBuffer();
       return statements;
     }
@@ -357,10 +398,7 @@ public:
     if (!interpreter.GetLastInstructionPageFault() &&
       !interpreter.GetLastInstructionAccessViolation()) {
       currentInstructionIndex++;
-
-      if (pagingManager != nullptr) {
-          pagingManager->UnpinAllPagesForProcess(pid);
-      }
+      ReleasePins();
     }
 
     auto output = interpreter.FlushBuffer();

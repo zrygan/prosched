@@ -327,8 +327,16 @@ public:
    *
    * Registers the interpreter with the paging manager and installs the
    * page-fault handler. The handler receives a page number and returns true
-   * when that page was not resident, which abandons the current instruction so
-   * the process can retry it once the page has been paged in.
+   * when that page was not usable on this pass, which abandons the current
+   * instruction so the process can retry it.
+   *
+   * "Not usable" covers both outcomes of a fault, and it must: a page that was
+   * successfully brought in still costs the instruction a restart, because the
+   * access that faulted has already been skipped; and a page that could NOT be
+   * brought in - every frame pinned by somebody else - is not there to be read
+   * or written at all. Reporting the second case as usable, which returning
+   * PageIn's own result did, let an access land on a page holding no frame and
+   * silently succeed against memory the process does not own.
    *
    * Does nothing when the scheduler is running without a paging manager, in
    * which case the interpreter never faults.
@@ -348,14 +356,13 @@ public:
         [pagingMgr, pid = p->GetPID()](int pageNum) {
           if (pagingMgr->IsPageResident(pid, pageNum)) {
             pagingMgr->PinPage(pid, pageNum);
-            return false;
+            return false; // resident and pinned: the access may proceed
           }
 
-          bool brought_in = pagingMgr->PageIn(pid, pageNum);
-          if (brought_in) {
+          if (pagingMgr->PageIn(pid, pageNum)) {
             pagingMgr->PinPage(pid, pageNum);
           }
-          return brought_in;
+          return true; // brought in or not, this pass cannot use it
         });
   }
 
@@ -762,6 +769,7 @@ private:
    */
   void fillWithRandomInstructions(Process *p, int memoryBytes,
                                   int commandAmount) {
+    p->ReserveInstructions(commandAmount);
     while (p->GetTotalInstructions() < commandAmount) {
       Statement instruction =
           prosched::GetRandomStatement(p->GetName(), 0, 0, memoryBytes);
@@ -841,23 +849,40 @@ private:
   }
 
   /**
-   * @brief gets the total memory used by all processes 
-   * 
-   * @return total memory of all active processes 
+   * @brief counts the cores currently holding a process
+   *
+   * @return number of busy workers
    */
-  size_t GetActiveMemory() {
-    size_t totalMemory = 0;
-
+  int CountBusyWorkers() const {
+    int busy = 0;
     for (Worker *w : workers) {
       if (w->IsBusy()) {
-        Process *runningProcess = w->GetCurrentProcess();
-        if (runningProcess != nullptr) {
-          totalMemory += runningProcess->GetMemorySize();
-        }
+        busy++;
       }
     }
+    return busy;
+  }
 
-    return totalMemory;
+  /**
+   * @brief whether another process may be placed on a core right now
+   *
+   * Under demand paging a process needs one frame at a time, not its whole
+   * address space, so the size of that address space must never gate dispatch -
+   * a process bigger than physical memory is exactly what paging is for. What
+   * does bound dispatch is the frame supply: a process on a core with no frame
+   * available to it makes no progress while counting as a busy core, so the
+   * number of resident processes is capped at the number of physical frames.
+   *
+   * Without a paging manager the interpreter never faults, so no memory
+   * constraint applies (same contract as attachPaging).
+   *
+   * @return true when a further process can be dispatched
+   */
+  bool CanAdmitAnotherProcess() const {
+    if (pagingManager == nullptr) {
+      return true;
+    }
+    return CountBusyWorkers() < pagingManager->GetTotalFrameCount();
   }
 
   /**
@@ -872,12 +897,11 @@ private:
     std::lock_guard<std::mutex> lock(schedulerMutex);
     for (Worker *w : workers) {
       if (!processQueue.empty() && !w->IsBusy()) {
-        Process *p = processQueue.front();
-
-        if (GetActiveMemory() + p->GetMemorySize() > (size_t)ctx.max_overall_mem) {
+        if (!CanAdmitAnotherProcess()) {
           break;
         }
 
+        Process *p = processQueue.front();
         processQueue.pop();
         w->AssignProcess(p);
       }
@@ -908,12 +932,11 @@ private:
       }
 
       if (!processQueue.empty()) {
-        Process *p = processQueue.front();
-
-        if (GetActiveMemory() + p->GetMemorySize() > (size_t)ctx.max_overall_mem) {
+        if (!CanAdmitAnotherProcess()) {
           break;
         }
-        
+
+        Process *p = processQueue.front();
         processQueue.pop();
         w->AssignProcess(p);
       }

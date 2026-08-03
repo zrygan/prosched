@@ -287,10 +287,14 @@ bool Interpreter::ParseUserProgram(const std::string& program,
 }
 
 void Interpreter::ExecuteStatements(const std::vector<Statement>& stmts) {
+  // The partial-progress latches are deliberately NOT cleared here. A statement
+  // abandoned by a page fault is retried from the beginning, and the latch is
+  // exactly what lets the retry skip the access that already succeeded - which
+  // is the only way an instruction spanning two pages can complete on a machine
+  // with one frame. Each latch instead records the statement that set it and is
+  // ignored by any other, so nothing stale can be misapplied.
   ResetAccessState();
   for (const Statement& stmt : stmts) {
-    has_pending_read_value_ = false;
-    pending_read_variable_.clear();
     ExecuteStatement(stmt);
   }
 }
@@ -832,7 +836,11 @@ std::optional<std::pair<std::string, uint16_t>> Interpreter::ExecuteRead(
   const std::string variable_name = Trim(stmt.args[0]);
   const uint32_t address = ParseAddress(stmt.args[1]);
 
-  if (!has_pending_read_value_) {
+  const bool have_latch = has_pending_read_value_ &&
+                          pending_read_address_ == address &&
+                          pending_read_variable_ == variable_name;
+
+  if (!have_latch) {
     AccessStatus status = CheckAccess(address);
     if (status == AccessStatus::kViolation) {
         last_instruction_access_violation_ = true;
@@ -853,6 +861,7 @@ std::optional<std::pair<std::string, uint16_t>> Interpreter::ExecuteRead(
 
     pending_read_value_ = value;
     pending_read_variable_ = variable_name;
+    pending_read_address_ = address;
     has_pending_read_value_ = true;
   }
 
@@ -881,24 +890,53 @@ std::optional<std::pair<uint32_t, uint16_t>> Interpreter::ExecuteWrite(
   }
 
   const uint32_t address = ParseAddress(stmt.args[0]);
+
+  // Bounds before anything else: an address the process does not own is a
+  // violation no matter what the operand resolves to, and it must never reach
+  // the pager. CheckAccess repeats this below - it is the pager half that has
+  // to come after the operand.
+  if (!IsValidAddress(address)) {
+    last_instruction_access_violation_ = true;
+    last_violation_address_ = address;
+    return std::nullopt;
+  }
+
+  // Symbol table first, and only once. Latching the value here means the data
+  // page below can evict the symbol-table page without losing the operand.
+  const std::string& operand = stmt.args[1];
+  const bool have_latch = has_pending_write_value_ &&
+                          pending_write_address_ == address &&
+                          pending_write_operand_ == operand;
+
+  if (!have_latch) {
+    const uint16_t value = ResolveOperand(operand);
+    if (last_instruction_page_fault_ || last_instruction_access_violation_) {
+      return std::nullopt;
+    }
+    pending_write_value_ = value;
+    pending_write_address_ = address;
+    pending_write_operand_ = operand;
+    has_pending_write_value_ = true;
+  }
+
   AccessStatus status = CheckAccess(address);
   if (status == AccessStatus::kViolation) {
+    has_pending_write_value_ = false;
     last_instruction_access_violation_ = true;
     last_violation_address_ = address;
     return std::nullopt;
   }
 
   if (status == AccessStatus::kFault) {
+    // The latch survives so the retry goes straight to the data page, by which
+    // point the symbol-table page is unpinned and can be evicted for it.
     last_instruction_page_fault_ = true;
     return std::nullopt;
   }
 
-  const uint16_t value = ResolveOperand(stmt.args[1]);
+  const uint16_t value = pending_write_value_;
+  has_pending_write_value_ = false;
 
-  if (last_instruction_page_fault_ || last_instruction_access_violation_) {
-    return std::nullopt;
-  }
-  
   {
     const std::lock_guard<std::mutex> guard(*paged_state_mutex_);
     address_space_[address] = value;

@@ -28,6 +28,10 @@ private:
 
   prosched::Process *preemptedProcess = nullptr;
 
+  // Whether this dispatch has already spent its one uncharged fault tick.
+  // See CheckAndIncrementQuantum.
+  bool faultTickForgiven = false;
+
   int lastProcessedTick = 0;
   int currentMasterTick = 0;
   std::condition_variable cv;
@@ -43,9 +47,16 @@ private:
   prosched::Process *PreemptProcessUnlocked() {
     prosched::Process *p = currentProcess;
     if (p != nullptr) {
+      // A process off its core is not accessing memory, so it keeps no frames
+      // pinned. Leaving them pinned strands physical memory in the ready queue:
+      // with as many resident processes as frames, a few preemptions are enough
+      // to leave every frame pinned by a process that is not running, and from
+      // there no page fault anywhere can ever be satisfied.
+      p->ReleasePins();
       p->SetState(prosched::ProcessState::READY);
       currentProcess = nullptr;
       preemptedProcess = p;
+      faultTickForgiven = false;
 
       if (ctx.schedulerType == SchedulerType::RR) {
         p->ResetQuantumUsed();
@@ -124,6 +135,7 @@ public:
       return nullptr;
     }
     currentProcess = p;
+    faultTickForgiven = false;
     if (p) {
       p->AssignCore(coreNum);
       p->SetState(ProcessState::RUNNING);
@@ -227,6 +239,18 @@ public:
    * @brief Increments quantum of the current running process and checks if it
    * has expired.
    *
+   * The quantum is spent by elapsed ticks, not by retired instructions, so a
+   * faulting process is charged like any other. Exempting faulters outright
+   * lets a process that cannot obtain a frame hold its core forever, and
+   * quantum expiry is the only thing that can take a core back from a process
+   * that is neither sleeping nor finished.
+   *
+   * The one concession is the first fault tick of each dispatch. Servicing a
+   * fault is work the process did not ask for, and charging it would leave a
+   * quantum-1 process unable to ever run the retry that uses the page it just
+   * paged in. Every fault after that is charged in full, so a process that
+   * keeps faulting because no frame is available still loses its core.
+   *
    * Thread-safe.
    * @param limit The quantum cycles limit.
    * @return true if quantum is exceeded, false otherwise.
@@ -236,7 +260,9 @@ public:
     if (currentProcess != nullptr &&
         currentProcess->GetState() == ProcessState::RUNNING) {
 
-          if(currentProcess->GetLastInstructionWasPageFault()) {
+          if (currentProcess->GetLastInstructionWasPageFault() &&
+              !faultTickForgiven) {
+            faultTickForgiven = true;
             return false;
           }
 
@@ -266,6 +292,7 @@ public:
       if (p->GetState() == ProcessState::WAITING ||
           p->GetState() == ProcessState::FINISHED ||
           p->GetState() == ProcessState::TERMINATED) {
+        p->ReleasePins(); // a sleeping process must not hold frames either
         currentProcess = nullptr;
         return;
       }
@@ -293,6 +320,7 @@ public:
     if (p->GetState() == ProcessState::FINISHED ||
         p->GetState() == ProcessState::WAITING ||
         p->GetState() == ProcessState::TERMINATED) {
+      p->ReleasePins();
       currentProcess = nullptr;
       return;
     }

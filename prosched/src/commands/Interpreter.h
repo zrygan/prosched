@@ -494,9 +494,25 @@ class Interpreter {
   mutable std::shared_ptr<std::mutex> paged_state_mutex_ =
       std::make_shared<std::mutex>();
 
+  /* READ and WRITE each touch two pages - the data page for the address and the
+     symbol-table page for the variable - but a faulting instruction restarts
+     from the beginning, so on a machine with one frame the two pages would
+     evict each other forever. Whichever half succeeds first is latched here so
+     the retry can skip it, leaving the page it used free to be evicted for the
+     other. No instruction then needs two pages resident at once.
+
+     Each latch carries the operands of the statement that set it. A latch is
+     honoured only by a statement with those same operands, so one left behind
+     by an abandoned statement cannot be misapplied to a later one. */
   uint16_t pending_read_value_ = 0;
   bool has_pending_read_value_ = false;
   std::string pending_read_variable_;
+  uint32_t pending_read_address_ = 0;
+
+  uint16_t pending_write_value_ = 0;
+  bool has_pending_write_value_ = false;
+  uint32_t pending_write_address_ = 0;
+  std::string pending_write_operand_;
 };
 
 }  // namespace prosched

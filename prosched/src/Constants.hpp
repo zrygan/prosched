@@ -10,5 +10,5 @@ namespace prosched {
     constexpr long kMaxProcessMemoryBytes = 65536; // 2^16
     constexpr std::size_t kMinUserInstructions = 1;
     constexpr std::size_t kMaxUserInstructions = 50;
-    constexpr std::string kMemoryUnit = "KB";
+    inline constexpr char kMemoryUnit[] = "KB";
 }

@@ -40,7 +40,12 @@ private:
   AlgoContext ctx;
   prosched::Scheduler *scheduler = nullptr;
   prosched::PagingManager *pagingManager = nullptr;
-  bool isInitialized;
+  // Read before it is ever assigned otherwise: Controller is default
+  // constructed in main(), so an uninitialised bool takes whatever the stack
+  // held. Reading true sends "initialize" to the post-init handler, which
+  // answers "Command unknown" and leaves scheduler null - the program never
+  // starts. It only appeared to work because a -O0 stack happened to be zero.
+  bool isInitialized = false;
 
 public:
   ~Controller();
