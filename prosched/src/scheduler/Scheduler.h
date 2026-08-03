@@ -841,6 +841,26 @@ private:
   }
 
   /**
+   * @brief gets the total memory used by all processes 
+   * 
+   * @return total memory of all active processes 
+   */
+  size_t GetActiveMemory() {
+    size_t totalMemory = 0;
+
+    for (Worker *w : workers) {
+      if (w->IsBusy()) {
+        Process *runningProcess = w->GetCurrentProcess();
+        if (runningProcess != nullptr) {
+          totalMemory += runningProcess->GetMemorySize();
+        }
+      }
+    }
+
+    return totalMemory;
+  }
+
+  /**
    * @brief First-Come First-Serve Scheduler Algorithm
    *
    * A non-preemptive algorithm in which processes are attended to in
@@ -853,6 +873,11 @@ private:
     for (Worker *w : workers) {
       if (!processQueue.empty() && !w->IsBusy()) {
         Process *p = processQueue.front();
+
+        if (GetActiveMemory() + p->GetMemorySize() > (size_t)ctx.max_overall_mem) {
+          break;
+        }
+
         processQueue.pop();
         w->AssignProcess(p);
       }
@@ -884,6 +909,11 @@ private:
 
       if (!processQueue.empty()) {
         Process *p = processQueue.front();
+
+        if (GetActiveMemory() + p->GetMemorySize() > (size_t)ctx.max_overall_mem) {
+          break;
+        }
+        
         processQueue.pop();
         w->AssignProcess(p);
       }
