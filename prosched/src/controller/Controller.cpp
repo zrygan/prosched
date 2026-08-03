@@ -192,6 +192,7 @@ Command Controller::GetParsedInput(const std::string &input) {
     if (commands.cliCommand != CLI_COMMAND::CLI_SCREEN_R &&
         trimmed.size() >= 4) {
       commands.memorySize = ParseMemorySize(trimmed[3]);
+      commands.memorySizeSpecified = true;
     }
     if (commands.cliCommand == CLI_COMMAND::CLI_SCREEN_C) {
       commands.instructions = ExtractQuotedInstructions(input);
@@ -252,6 +253,15 @@ std::string Controller::FormatAccessViolationNotice(const std::string &name,
   return oss.str();
 }
 
+long Controller::RollProcessMemorySize() const {
+  const long low = this->ctx.min_mem_per_proc;
+  const long high = this->ctx.max_mem_per_proc;
+  if (high <= low) {
+    return low;
+  }
+  return low + rand() % (high - low + 1);
+}
+
 bool Controller::IsValidMemoryAllocation(long bytes) {
   if (bytes < prosched::kMinProcessMemoryBytes ||
       bytes > prosched::kMaxProcessMemoryBytes) {
@@ -282,12 +292,17 @@ void Controller::ExecuteCommand(const Command &command) {
                      "<process_memory_size>\n\n";
         break;
       }
-      if (!IsValidMemoryAllocation(command.memorySize)) {
+      // An omitted size falls back to the config's per-process range; only a
+      // size the user actually typed is held to the power-of-2 bounds.
+      long memorySize = command.memorySize;
+      if (!command.memorySizeSpecified) {
+        memorySize = RollProcessMemorySize();
+      } else if (!IsValidMemoryAllocation(memorySize)) {
         std::cout << "invalid memory allocation\n\n";
         break;
       }
       prosched::Process *p = this->scheduler->CreateNamedProcess(
-          command.processName, command.memorySize);
+          command.processName, memorySize);
       this->scheduler->AddProcess(p);
       EnterProcessScreen(p);
       break;
@@ -299,7 +314,10 @@ void Controller::ExecuteCommand(const Command &command) {
                      "<process_memory_size> \"<instructions>\"\n\n";
         break;
       }
-      if (!IsValidMemoryAllocation(command.memorySize)) {
+      long memorySize = command.memorySize;
+      if (!command.memorySizeSpecified) {
+        memorySize = RollProcessMemorySize();
+      } else if (!IsValidMemoryAllocation(memorySize)) {
         std::cout << "invalid memory allocation\n\n";
         break;
       }
@@ -314,7 +332,7 @@ void Controller::ExecuteCommand(const Command &command) {
       }
 
       prosched::Process *p = this->scheduler->CreateProcessWithInstructions(
-          command.processName, command.memorySize, program);
+          command.processName, memorySize, program);
       this->scheduler->AddProcess(p);
       EnterProcessScreen(p);
       break;
@@ -342,9 +360,21 @@ void Controller::ExecuteCommand(const Command &command) {
                          terminated->GetLastViolationClockTime(),
                          terminated->GetLastViolationAddress())
                   << "\n\n";
-      } else {
-        std::cout << "Process " << command.processName << " not found.\n\n";
+        break;
       }
+
+      // A short program can be over before the user gets to type "screen -r",
+      // and its output is only reachable through its screen. Attaching to a
+      // finished process shows the logs it already produced; "not found" is
+      // kept for a name that was never created at all.
+      prosched::Process *finished =
+          this->scheduler->FindFinishedProcessByName(command.processName);
+      if (finished != nullptr) {
+        EnterProcessScreen(finished);
+        break;
+      }
+
+      std::cout << "Process " << command.processName << " not found.\n\n";
       break;
     }
 
@@ -437,6 +467,29 @@ void Controller::EnterProcessScreen(prosched::Process *p) {
     std::cout << "\033[" << rows << ";1H\033[2Kroot:\\> " << cmd << std::flush;
   };
 
+  // The process view, as "process-smi" prints it inside this screen.
+  auto process_smi_text = [&]() {
+    int total = p->GetTotalInstructions();
+    int current = p->GetCurrentInstructionIndex();
+    std::ostringstream oss;
+    oss << "Process name: " << p->GetName();
+    oss << "\nID: " << p->GetPID();
+    oss << "\nLogs:";
+    for (const auto &log : p->GetLogs())
+      oss << "\n" << log;
+    oss << "\n";
+    if (current >= total)
+      oss << "\nFinished!";
+    else {
+      oss << "\nCurrent instruction line: " << current + 1;
+      oss << "\nLines of code: " << total;
+    }
+    return oss.str();
+  };
+
+  // Attaching to a process is a request to see it, so the screen opens on the
+  // process view rather than on an empty pane the user has to prompt.
+  push_output(process_smi_text());
   render_full();
 
   while (true) {
@@ -453,22 +506,7 @@ void Controller::EnterProcessScreen(prosched::Process *p) {
       scroll_offset = 0;
 
       if (trimmed == "process-smi") {
-        int total = p->GetTotalInstructions();
-        int current = p->GetCurrentInstructionIndex();
-        std::ostringstream oss;
-        oss << "Process name: " << p->GetName();
-        oss << "\nID: " << p->GetPID();
-        oss << "\nLogs:";
-        for (const auto &log : p->GetLogs())
-          oss << "\n" << log;
-        oss << "\n";
-        if (current >= total)
-          oss << "\nFinished!";
-        else {
-          oss << "\nCurrent instruction line: " << current + 1;
-          oss << "\nLines of code: " << total;
-        }
-        push_output(oss.str());
+        push_output(process_smi_text());
       } else if (trimmed == "exit") {
         restore();
         return;

@@ -28,6 +28,12 @@ struct Command {
   std::string processName;
   long memorySize = 0;
 
+  // False when the command line carried no size token at all, which is a
+  // different case from a token that parsed to nothing usable: a missing size
+  // is rolled from the config's min/max-mem-per-proc, a malformed one is still
+  // rejected as "invalid memory allocation".
+  bool memorySizeSpecified = false;
+
   // specifically for screen -c: the quoted instruction list, with the
   // surrounding quotes stripped. Empty when none was supplied.
   std::string instructions;
@@ -60,6 +66,20 @@ public:
   CLI_COMMAND IdentifyCommand(const std::vector<std::string> &command);
   static long ParseMemorySize(const std::string &token);
   static bool IsValidMemoryAllocation(long bytes);
+
+  /**
+   * @brief Picks a process size the way the scheduler picks one for the
+   * processes it generates itself.
+   *
+   * "screen -s"/"screen -c" are specified with an explicit size, but the
+   * grading scripts also type them without one. Rolling from
+   * min/max-mem-per-proc is what the config already means by those keys, so an
+   * omitted size behaves exactly like an auto-generated process rather than
+   * failing the command.
+   *
+   * @return A size in bytes drawn from [min_mem_per_proc, max_mem_per_proc]
+   */
+  long RollProcessMemorySize() const;
 
   /**
    * @brief Extracts the quoted instruction list from a raw "screen -c" input.

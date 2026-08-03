@@ -182,6 +182,37 @@ public:
   }
 
   /**
+   * @brief whether a process could ever hold the page it is executing
+   *
+   * Demand paging lets a process run with only part of its address space
+   * resident, but never with none of it: the page an instruction touches has
+   * to occupy a frame while the instruction runs. A process whose declared
+   * address space is larger than the whole of physical memory can therefore
+   * never be backed - the pager would have to evict that process' own pages to
+   * load that process' own pages - so it is admitted to the system, and listed
+   * by "screen -ls" / "process-smi", but never placed in the ready queue. With
+   * every process in that state the machine idles at 0% utilization, which is
+   * the correct outcome for a configuration whose per-process memory exceeds
+   * max-overall-mem.
+   *
+   * A process exactly the size of physical memory still fits, which is what
+   * keeps the one-frame grading configuration (max-overall-mem ==
+   * mem-per-frame == min/max-mem-per-proc) running one process at a time
+   * instead of none. Without a paging manager there is no physical limit to
+   * compare against, the same contract as attachPaging.
+   *
+   * @param p process to test, may be null
+   * @return true when the process may enter the ready queue
+   */
+  bool FitsInPhysicalMemory(prosched::Process *p) const {
+    if (pagingManager == nullptr || p == nullptr) {
+      return true;
+    }
+    return p->GetMemorySize() <=
+           pagingManager->GetMemoryStats().totalMemoryBytes;
+  }
+
+  /**
    * @brief Adds a Process to the processQueue
    *
    * Registers the specified process with the scheduler and places it into the
@@ -197,7 +228,9 @@ public:
     try {
       processes.push_back(p);
       activeProcesses.push_back(p);
-      processQueue.push(p);
+      if (FitsInPhysicalMemory(p)) {
+        processQueue.push(p);
+      }
       return p;
     } catch (const std::bad_alloc &e) {
       std::cerr << "Allocation failed: " << e.what();
@@ -553,6 +586,32 @@ public:
   }
 
   /**
+   * @brief Finds the most recent process with the given name that ran to
+   * completion.
+   *
+   * Deliberately separate from FindProcessByName, which only ever hands back a
+   * process that is still live. A process that finished still owns its logs,
+   * and "screen -r" is how the user reads them, so it needs a way to reach one
+   * without changing what "attachable" means anywhere else.
+   *
+   * A process shut down by an access violation is NOT matched here - that case
+   * has its own message - so the two lookups never both answer for one name.
+   *
+   * @param name The process name to search for
+   * @return Pointer to the matching finished process, or nullptr if none
+   */
+  prosched::Process *FindFinishedProcessByName(const std::string &name) {
+    std::lock_guard<std::mutex> lock(schedulerMutex);
+    for (auto it = processes.rbegin(); it != processes.rend(); ++it) {
+      Process *p = *it;
+      if (p && p->GetName() == name && p->IsFinished() && !p->IsTerminated()) {
+        return p;
+      }
+    }
+    return nullptr;
+  }
+
+  /**
    * @brief Returns a snapshot of all known processes (running and finished).
    *
    * @return Vector of process pointers
@@ -608,7 +667,11 @@ public:
     Process *p = generateProcess(&this->ctx, pid, cpuCycles);
 
     std::lock_guard<std::mutex> lock(schedulerMutex);
-    processQueue.push(p);
+    // A process too large for physical memory is still created and reported,
+    // it just never becomes runnable - see FitsInPhysicalMemory.
+    if (FitsInPhysicalMemory(p)) {
+      processQueue.push(p);
+    }
     processes.push_back(p);
     activeProcesses.push_back(p);
   }
