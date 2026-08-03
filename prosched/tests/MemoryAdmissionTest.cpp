@@ -169,11 +169,20 @@ TEST(SchedulerMemoryAdmission, CoresInUseNeverExceedsAvailableFrames) {
          "means the extras are occupying cores they cannot use.";
 }
 
-// The other side of admission control: a process BIGGER than physical memory
-// must still run, because demand paging exists precisely so that it can. The
-// program here is pure PRINT, so it needs no pages at all - if it does not
-// finish, the memory check refused it, not the pager.
-TEST(SchedulerMemoryAdmission, ProcessLargerThanPhysicalMemoryStillRuns) {
+// The other side of admission control. This test used to assert the opposite -
+// that a process bigger than physical memory still runs, because demand paging
+// exists precisely so that it can - and it passed: a pure-PRINT program touches
+// no data pages, so nothing stopped it.
+//
+// MO2 grading question 7 rules that out. Its config gives every process twice
+// as much declared memory as the machine has and expects 0% utilization
+// indefinitely, and no working-set rule can separate that config from this one:
+// both are "declared size exceeds physical memory", and in both the instruction
+// actually executing needs one page or none. The size comparison is the only
+// discriminator available, so the rule is now Scheduler::FitsInPhysicalMemory
+// and such a process is never dispatched. What demand paging still buys is
+// covered by DemandPagingStillOversubscribesMemory below.
+TEST(SchedulerMemoryAdmission, ProcessLargerThanPhysicalMemoryIsNeverDispatched) {
   prosched::PagingManager pm(256, 256);
   ASSERT_EQ(pm.GetTotalFrameCount(), 1) << "precondition: a single frame";
 
@@ -188,7 +197,7 @@ TEST(SchedulerMemoryAdmission, ProcessLargerThanPhysicalMemoryStillRuns) {
   print.args = {"\"hello\""};
   const std::vector<prosched::Statement> program(5, print);
 
-  // 2048 bytes = 8 pages against 1 frame: paging's whole job.
+  // 2048 bytes = 8 pages on a machine that owns 1.
   prosched::Process *p =
       scheduler.CreateProcessWithInstructions("big", 2048, program);
   ASSERT_NE(p, nullptr);
@@ -196,22 +205,85 @@ TEST(SchedulerMemoryAdmission, ProcessLargerThanPhysicalMemoryStillRuns) {
 
   ASSERT_TRUE(scheduler.Start());
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
   while (std::chrono::steady_clock::now() < deadline && !p->IsFinished()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
-  const bool finished = p->IsFinished();
   const int reached = p->GetCurrentInstructionIndex();
   scheduler.Stop();
 
-  EXPECT_TRUE(finished)
+  EXPECT_EQ(reached, 0)
       << "a 2048-byte process on a 256-byte machine retired " << reached
-      << " of 5 PRINT instructions in 2 s. The dispatch guard compares the "
-         "process's entire size against max-overall-mem, so any process larger "
-         "than physical memory is permanently unschedulable - it never reaches "
-         "a core, never faults, and sits in the ready queue forever. Under "
-         "demand paging the size of the address space must not gate dispatch; "
-         "only the frames an instruction actually needs do.";
+      << " of 5 instructions. It must retire none: it can never hold the page "
+         "it is executing, and question 7's expected deadlock depends on that "
+         "being true for every process in the system.";
+}
+
+// The guarantee that survives: memory is still oversubscribed across processes.
+// Four 1024-byte processes fit individually but need 64 pages between them
+// against 16 frames, so every one of them can only finish if pages are brought
+// in and evicted on demand. This is what the inverted test above used to
+// protect, expressed in a way question 7 does not contradict.
+TEST(SchedulerMemoryAdmission, DemandPagingStillOversubscribesMemory) {
+  const int kProcs = 4;
+  const int kProcMem = 1024;
+
+  prosched::PagingManager pm(/*memPerFrame=*/64, /*maxOverallMem=*/1024);
+  ASSERT_EQ(pm.GetTotalFrameCount(), 16);
+
+  prosched::Scheduler scheduler(
+      makeMemoryCtx(/*num_cpu=*/4, /*quantum=*/5, kProcMem,
+                    /*memPerFrame=*/64, /*maxOverallMem=*/1024, /*minIns=*/1,
+                    /*maxIns=*/1000, /*delay=*/0),
+      &pm);
+
+  // Writes spread across the address space, so the processes really do compete
+  // for frames instead of all living on page 0.
+  std::vector<prosched::Statement> program;
+  for (int addr = 0; addr < kProcMem - 2; addr += 64) {
+    program.push_back(WriteStmt("0x" + [addr] {
+                                  std::ostringstream oss;
+                                  oss << std::hex << addr;
+                                  return oss.str();
+                                }(),
+                                "7"));
+  }
+
+  std::vector<prosched::Process *> procs;
+  for (int i = 0; i < kProcs; ++i) {
+    prosched::Process *p = scheduler.CreateProcessWithInstructions(
+        "writer" + std::to_string(i + 1), kProcMem, program);
+    ASSERT_NE(p, nullptr);
+    ASSERT_NE(scheduler.AddProcess(p), nullptr);
+    procs.push_back(p);
+  }
+
+  ASSERT_TRUE(scheduler.Start());
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  auto allDone = [&procs] {
+    for (prosched::Process *p : procs) {
+      if (!p->IsFinished()) {
+        return false;
+      }
+    }
+    return true;
+  };
+  while (std::chrono::steady_clock::now() < deadline && !allDone()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  const bool done = allDone();
+  const auto stats = pm.GetMemoryStats();
+  scheduler.Stop();
+
+  EXPECT_TRUE(done)
+      << "4 processes of " << kProcMem << " bytes each (64 pages in total) did "
+      << "not all finish on a 16-frame machine in 5 s. Each one fits in "
+         "memory on its own, so the admission rule must let them all run and "
+         "the pager must multiplex the frames between them.";
+  EXPECT_GT(stats.pagesPagedIn, 0u)
+      << "no page was ever brought in, so this configuration did not exercise "
+         "demand paging at all";
 }
 
 // The handler Scheduler::attachPaging installs answers one question - "may this
@@ -371,3 +443,129 @@ TEST(WorkerPageFaultRelease, FaultingProcessGivesUpItsCore) {
 }
 
 } // namespace WorkerPageFaultRelease
+
+// MO2 grading scenario, question 7:
+//
+//     num-cpu 8 / scheduler rr / quantum-cycles 4 / batch-process-freq 1
+//     min-ins 10000 / max-ins 10000 / delay-per-exec 0
+//     max-overall-mem 16384 / mem-per-frame 8
+//     min-mem-per-proc 32768 / max-mem-per-proc 32768
+//
+//   "0% CPU utilization occurs indefinitely because the memory manager will
+//    attempt to page in and out on the processes but can no longer progress
+//    because there's insufficient memory. The system reaches a deadlock (no
+//    processes executing)."
+//
+// Every process declares 32768 bytes = 4096 pages against 2048 frames, i.e.
+// twice the whole machine. Demand paging on its own does not notice: a process
+// only ever touches a handful of pages, so it runs happily and the config
+// reported 100% utilization. Scheduler::FitsInPhysicalMemory is the rule that
+// makes the shortfall visible - a process that can never be resident is never
+// queued, and with every process in that state the machine idles.
+namespace SchedulerOversizedProcess {
+
+// The rule itself, at the boundary. Equal-to-memory must still fit: that is the
+// question-4 configuration, which has to keep running one process at a time.
+TEST(SchedulerOversizedProcess, FitRuleIsExclusiveAtTotalMemory) {
+  prosched::PagingManager pm(/*memPerFrame=*/8, /*maxOverallMem=*/16384);
+  prosched::Scheduler scheduler(
+      makeMemoryCtx(/*num_cpu=*/8, /*quantum=*/4, /*memPerProc=*/32768,
+                    /*memPerFrame=*/8, /*maxOverallMem=*/16384,
+                    /*minIns=*/1, /*maxIns=*/1, /*delay=*/0),
+      &pm);
+
+  prosched::Process smaller("smaller", 1, 0);
+  smaller.SetMemoryBounds(0, 16383);
+  prosched::Process exact("exact", 2, 0);
+  exact.SetMemoryBounds(0, 16384);
+  prosched::Process oversized("oversized", 3, 0);
+  oversized.SetMemoryBounds(0, 16385);
+
+  EXPECT_TRUE(scheduler.FitsInPhysicalMemory(&smaller));
+  EXPECT_TRUE(scheduler.FitsInPhysicalMemory(&exact))
+      << "a process exactly the size of physical memory is admissible - the "
+         "question-4 config (max-overall-mem == mem-per-proc) depends on it";
+  EXPECT_FALSE(scheduler.FitsInPhysicalMemory(&oversized));
+}
+
+// A process that cannot ever be resident is still created and reported, it just
+// never reaches the ready queue: "no processes executing", not "no processes".
+TEST(SchedulerOversizedProcess, OversizedProcessIsRecordedButNeverQueued) {
+  prosched::PagingManager pm(/*memPerFrame=*/8, /*maxOverallMem=*/16384);
+  prosched::Scheduler scheduler(
+      makeMemoryCtx(/*num_cpu=*/8, /*quantum=*/4, /*memPerProc=*/32768,
+                    /*memPerFrame=*/8, /*maxOverallMem=*/16384,
+                    /*minIns=*/1, /*maxIns=*/1, /*delay=*/0),
+      &pm);
+
+  prosched::Process *fits = scheduler.CreateNamedProcess("fits", 16384);
+  prosched::Process *oversized = scheduler.CreateNamedProcess("oversized", 32768);
+  ASSERT_NE(scheduler.AddProcess(fits), nullptr);
+  ASSERT_NE(scheduler.AddProcess(oversized), nullptr);
+
+  const auto all = scheduler.GetAllProcesses();
+  EXPECT_EQ(all.size(), 2u)
+      << "both processes must remain visible to screen -ls / process-smi";
+
+  const auto queued = scheduler.GetReadyQueueSnapshot();
+  ASSERT_EQ(queued.size(), 1u)
+      << "a 32768-byte process was queued against 16384 bytes of physical "
+         "memory; it can never hold the page it is executing, so it must not "
+         "be dispatchable";
+  EXPECT_EQ(queued[0]->GetName(), "fits");
+}
+
+// The scenario end to end: the grading config, driven the way the grader drives
+// it, must idle at 0% for the whole observation window.
+TEST(SchedulerOversizedProcess, GradingConfigIdlesAtZeroUtilization) {
+  prosched::PagingManager pm(/*memPerFrame=*/8, /*maxOverallMem=*/16384);
+  ASSERT_EQ(pm.GetTotalFrameCount(), 2048);
+
+  prosched::Scheduler scheduler(
+      makeMemoryCtx(/*num_cpu=*/8, /*quantum=*/4, /*memPerProc=*/32768,
+                    /*memPerFrame=*/8, /*maxOverallMem=*/16384,
+                    /*minIns=*/10000, /*maxIns=*/10000, /*delay=*/0,
+                    /*batchFreq=*/1),
+      &pm);
+
+  ASSERT_TRUE(scheduler.Start());
+  scheduler.ResumeGenerating();
+  const double peak = PeakUtilization(scheduler, std::chrono::milliseconds(500));
+  scheduler.StopGenerating();
+  const std::size_t created = scheduler.GetAllProcesses().size();
+  scheduler.Stop();
+
+  ASSERT_GT(created, 0u)
+      << "precondition: the scheduler must have generated processes, otherwise "
+         "0% utilization proves nothing";
+  EXPECT_DOUBLE_EQ(peak, 0.0)
+      << "peak CPU utilization was " << peak << "% across " << created
+      << " processes of 32768 bytes each on a 16384-byte machine. Every one of "
+         "them declares twice as much memory as exists, so none can ever hold "
+         "the page it is executing; the MO2 question-7 scenario expects 0% "
+         "utilization indefinitely (deadlock, no processes executing).";
+}
+
+// The guard must not cost anything when memory is adequate: the same driver
+// with processes that fit has to keep the cores busy.
+TEST(SchedulerOversizedProcess, ProcessesThatFitStillRun) {
+  prosched::PagingManager pm(/*memPerFrame=*/8, /*maxOverallMem=*/16384);
+  prosched::Scheduler scheduler(
+      makeMemoryCtx(/*num_cpu=*/8, /*quantum=*/4, /*memPerProc=*/512,
+                    /*memPerFrame=*/8, /*maxOverallMem=*/16384,
+                    /*minIns=*/1000, /*maxIns=*/1000, /*delay=*/0,
+                    /*batchFreq=*/1),
+      &pm);
+
+  ASSERT_TRUE(scheduler.Start());
+  scheduler.ResumeGenerating();
+  const double peak = PeakUtilization(scheduler, std::chrono::milliseconds(500));
+  scheduler.StopGenerating();
+  scheduler.Stop();
+
+  EXPECT_GT(peak, 0.0)
+      << "512-byte processes fit comfortably in 16384 bytes of memory, so the "
+         "oversized-process guard must leave them dispatchable";
+}
+
+} // namespace SchedulerOversizedProcess

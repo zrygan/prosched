@@ -101,9 +101,10 @@ namespace ScreenCQuestion5Parsing {
 
 // The command as the grading script types it carries NO memory-size argument,
 // but "screen -c" is specified as
-// `screen -c <process_name> <process_memory_size> "<instructions>"`. The parser
-// therefore reads the first word of the program as the size.
-TEST(ScreenCQuestion5Parsing, CommandWithoutAMemorySizeYieldsNoValidSize) {
+// `screen -c <process_name> <process_memory_size> "<instructions>"`. The
+// missing token has to be recognisable as missing, so ExecuteCommand can roll
+// a size from the config instead of rejecting the whole command.
+TEST(ScreenCQuestion5Parsing, CommandWithoutAMemorySizeIsMarkedUnspecified) {
   const std::string input =
       std::string("screen -c faulty_process \"") + kQuestion5Program + "\"";
 
@@ -112,18 +113,48 @@ TEST(ScreenCQuestion5Parsing, CommandWithoutAMemorySizeYieldsNoValidSize) {
 
   EXPECT_EQ(parsed.cliCommand, CLI_COMMAND::CLI_SCREEN_C);
   EXPECT_EQ(parsed.processName, "faulty_process");
-  EXPECT_FALSE(Controller::IsValidMemoryAllocation(parsed.memorySize))
-      << "parsed memory size " << parsed.memorySize
-      << " from a command that has no size argument. ExecuteCommand rejects "
-         "this with \"invalid memory allocation\" and the process is never "
-         "created, so nothing is printed. The scenario needs an explicit size, "
-         "e.g. screen -c faulty_process 2048 \"...\".";
+  EXPECT_FALSE(parsed.memorySizeSpecified)
+      << "no size token was typed, so the command must not be treated as "
+         "carrying one - otherwise it is rejected with \"invalid memory "
+         "allocation\" and the process is never created";
 
-  // The program itself is well-formed - only the missing size is at issue.
+  // The program itself is well-formed - the first word of it must never be
+  // mistaken for the size.
   std::vector<prosched::Statement> program;
   prosched::Interpreter parser;
   EXPECT_TRUE(parser.ParseUserProgram(parsed.instructions, program));
   EXPECT_EQ(program.size(), 7u);
+}
+
+// An omitted size and a malformed one are different failures: only the second
+// is an error. Nothing about "screen -c myproc abc" should now be forgiven.
+TEST(ScreenCQuestion5Parsing, MalformedSizeIsStillSpecifiedAndInvalid) {
+  Controller controller;
+  Command parsed =
+      controller.GetParsedInput(R"~(screen -c myproc abc "PRINT(x)")~");
+
+  EXPECT_EQ(parsed.cliCommand, CLI_COMMAND::CLI_SCREEN_C);
+  EXPECT_TRUE(parsed.memorySizeSpecified);
+  EXPECT_FALSE(Controller::IsValidMemoryAllocation(parsed.memorySize));
+}
+
+TEST(ScreenCQuestion5Parsing, ExplicitSizeIsStillParsedAndMarkedSpecified) {
+  Controller controller;
+  Command parsed =
+      controller.GetParsedInput(R"~(screen -c myproc 256 "PRINT(x)")~");
+
+  EXPECT_TRUE(parsed.memorySizeSpecified);
+  EXPECT_EQ(parsed.memorySize, 256);
+}
+
+// "screen -s" takes the same size argument and the same omission.
+TEST(ScreenCQuestion5Parsing, ScreenSWithoutASizeIsMarkedUnspecified) {
+  Controller controller;
+  Command parsed = controller.GetParsedInput("screen -s myproc");
+
+  EXPECT_EQ(parsed.cliCommand, CLI_COMMAND::CLI_SCREEN_S);
+  EXPECT_EQ(parsed.processName, "myproc");
+  EXPECT_FALSE(parsed.memorySizeSpecified);
 }
 
 } // namespace ScreenCQuestion5Parsing
@@ -162,10 +193,20 @@ TEST(ScreenCQuestion5Execution, ConfigSizedProcessDiesOnTheOutOfRangeWrite) {
 // The scenario's stated expectation, with a size that makes 0x500 legal
 // (2048 = the smallest valid power of 2 above 0x502). The program must run to
 // completion and print both variables.
+//
+// The machine is sized to 2048 bytes here rather than the config's 256. A
+// process may no longer be dispatched while its declared address space exceeds
+// physical memory (Scheduler::FitsInPhysicalMemory, required by grading
+// question 7's deadlock), so asking for a 2048-byte address space means asking
+// for a machine that can hold one. Question 5 itself is unaffected: it types
+// "screen -c faulty_process" with no size, which rolls the config's 256 bytes
+// and fits - that path is pinned by
+// ConfigSizedProcessDiesOnTheOutOfRangeWrite above.
 TEST(ScreenCQuestion5Execution, ProgramPrintsBothVariablesWhenTheAddressFits) {
-  prosched::PagingManager pm(256, 256);
-  ASSERT_EQ(pm.GetTotalFrameCount(), 1)
-      << "precondition: max-overall-mem 256 / mem-per-frame 256 = one frame";
+  prosched::PagingManager pm(256, 2048);
+  ASSERT_EQ(pm.GetTotalFrameCount(), 8)
+      << "precondition: 2048 bytes of memory in 256-byte frames = 8 frames, "
+         "enough to hold the 2048-byte process the program needs";
 
   prosched::Scheduler scheduler(makeQuestion5Ctx(), &pm);
   std::vector<prosched::Statement> program = ParseQuestion5Program();
@@ -188,11 +229,10 @@ TEST(ScreenCQuestion5Execution, ProgramPrintsBothVariablesWhenTheAddressFits) {
       << "the program stalled at instruction " << reached
       << " of 7 after 3 s. Two separate blockers produce this, and which one "
          "is hit shows in the index above:\n"
-         "  index 0 - the process was never dispatched at all. Scheduler's "
-         "dispatch guard compares the process's WHOLE size against "
-         "max-overall-mem, so a 2048-byte process can never run on a "
-         "256-byte machine. Under demand paging it should: that is what "
-         "paging is for.\n"
+         "  index 0 - the process was never dispatched at all, which here "
+         "would mean Scheduler::FitsInPhysicalMemory rejected a process that "
+         "does fit (2048 bytes of process, 2048 bytes of memory); the rule is "
+         "meant to be exclusive only ABOVE physical memory.\n"
          "  index 3 - WRITE 0x500 needs TWO pages resident at once, page 5 "
          "for the data and page 0 for the symbol table holding varA, but "
          "there is only ONE frame. A faulting instruction restarts from the "
@@ -208,3 +248,75 @@ TEST(ScreenCQuestion5Execution, ProgramPrintsBothVariablesWhenTheAddressFits) {
 }
 
 } // namespace ScreenCQuestion5Execution
+
+namespace ScreenCQuestion5LowAddress {
+
+// The same scenario with the address moved to 0x000, which is the form the
+// grading script now types. 0 is inside a 256-byte space and sits on page 0 -
+// the page the symbol table already occupies - so the WRITE needs only the one
+// frame this config has, and the whole program runs on the config's own size.
+const char *kLowAddressProgram =
+    "DECLARE varA 10; DECLARE varB 5; ADD varA varA varB; WRITE 0x000 varA; "
+    "READ varC 0x000; PRINT(\"Variable A: \" + varA); "
+    "PRINT(\"Result: \" + varC)";
+
+TEST(ScreenCQuestion5LowAddress, ProgramPrintsBothVariablesOnAConfigSizedProc) {
+  prosched::PagingManager pm(256, 256);
+  ASSERT_EQ(pm.GetTotalFrameCount(), 1);
+
+  prosched::Scheduler scheduler(makeQuestion5Ctx(), &pm);
+
+  std::vector<prosched::Statement> program;
+  prosched::Interpreter parser;
+  ASSERT_TRUE(parser.ParseUserProgram(kLowAddressProgram, program));
+  ASSERT_EQ(program.size(), 7u);
+
+  prosched::Process *p =
+      scheduler.CreateProcessWithInstructions("faulty_process", 256, program);
+  ASSERT_NE(p, nullptr);
+  ASSERT_NE(scheduler.AddProcess(p), nullptr);
+
+  ASSERT_TRUE(scheduler.Start());
+  const bool ended = RunUntilEnded(scheduler, p, std::chrono::seconds(3));
+  scheduler.Stop();
+
+  ASSERT_TRUE(ended) << "the program stalled at instruction "
+                     << p->GetCurrentInstructionIndex() << " of 7. Logs:"
+                     << JoinLogs(p);
+  EXPECT_FALSE(p->IsTerminated())
+      << "0x000 is inside a 256-byte address space - no access violation";
+  EXPECT_TRUE(LogsContain(p, "Variable A: 15"))
+      << "expected \"Variable A: 15\" (10 + 5). Logs:" << JoinLogs(p);
+  EXPECT_TRUE(LogsContain(p, "Result: 15"))
+      << "expected \"Result: 15\" read back from 0x000. Logs:" << JoinLogs(p);
+
+  // The scenario reads that output through "screen -r" after the program has
+  // already ended, which is only possible if a finished process stays
+  // reachable by name.
+  EXPECT_EQ(scheduler.FindProcessByName("faulty_process"), nullptr);
+  EXPECT_EQ(scheduler.FindFinishedProcessByName("faulty_process"), p);
+}
+
+// A process shut down by an access violation must keep reporting the violation
+// message, not get quietly attached to as if it had completed.
+TEST(ScreenCQuestion5LowAddress, TerminatedProcessIsNotTreatedAsFinished) {
+  prosched::PagingManager pm(256, 256);
+  prosched::Scheduler scheduler(makeQuestion5Ctx(), &pm);
+
+  std::vector<prosched::Statement> program = ParseQuestion5Program(); // 0x500
+  ASSERT_EQ(program.size(), 7u);
+
+  prosched::Process *p =
+      scheduler.CreateProcessWithInstructions("faulty_process", 256, program);
+  ASSERT_NE(scheduler.AddProcess(p), nullptr);
+
+  ASSERT_TRUE(scheduler.Start());
+  ASSERT_TRUE(RunUntilEnded(scheduler, p, std::chrono::seconds(3)));
+  scheduler.Stop();
+
+  ASSERT_TRUE(p->IsTerminated());
+  EXPECT_EQ(scheduler.FindFinishedProcessByName("faulty_process"), nullptr);
+  EXPECT_EQ(scheduler.FindTerminatedProcessByName("faulty_process"), p);
+}
+
+} // namespace ScreenCQuestion5LowAddress

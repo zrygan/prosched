@@ -702,6 +702,36 @@ TEST(SchedulerFindProcessByName, ReturnsNullForFinishedProcess) {
   EXPECT_EQ(found, nullptr);
 }
 
+// A finished process is unreachable through FindProcessByName by design, but
+// its logs still have to be readable - that is what "screen -r" attaches to
+// once a short program has already run to completion.
+TEST(SchedulerFindProcessByName, FinishedProcessIsFoundByTheFinishedLookup) {
+  prosched::Scheduler scheduler(makeTestCtx());
+  prosched::Process p("done_proc", 1, 0);
+  AddRaw(p, "PRINT(\"x\")");
+  scheduler.AddProcess(&p);
+  p.ExecuteInstructions(0);
+  ASSERT_TRUE(p.IsFinished());
+
+  EXPECT_EQ(scheduler.FindProcessByName("done_proc"), nullptr);
+
+  prosched::Process *found = scheduler.FindFinishedProcessByName("done_proc");
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->GetName(), "done_proc");
+}
+
+// A process still running has not finished, so the finished lookup must not
+// claim it - otherwise "screen -r" could attach through the wrong path.
+TEST(SchedulerFindProcessByName, FinishedLookupIgnoresLiveAndUnknownNames) {
+  prosched::Scheduler scheduler(makeTestCtx());
+  prosched::Process p("live_proc", 1, 0);
+  AddRaw(p, "PRINT(\"x\")");
+  scheduler.AddProcess(&p);
+
+  EXPECT_EQ(scheduler.FindFinishedProcessByName("live_proc"), nullptr);
+  EXPECT_EQ(scheduler.FindFinishedProcessByName("nonexistent"), nullptr);
+}
+
 } // namespace SchedulerFindProcessByName
 
 namespace SchedulerCreateNamedProcess {
